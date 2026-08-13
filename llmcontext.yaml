@@ -1,0 +1,37 @@
+project: "llmctx"
+stack: "Rust (tokio, reqwest, clap, serde, sha2, ignore), TypeScript (VS Code extension API)"
+task: "Build and ship v0.1.0 — core crate, daemon, CLI, VS Code extension"
+
+conventions:
+  - "No unwrap() in library code — use thiserror + anyhow at boundaries"
+  - "Every public async fn returns a typed Result; never panics"
+  - "process_file() is the single authoritative decision fn — daemon and CLI never reimplement its branch logic"
+  - "ADS version stamp is prepended by write_ads(), never by callers"
+  - "LLMCTX comment blocks are invisible infrastructure — do not narrate them to users"
+
+llmctx_ignore:
+  - "target/**"
+  - "vscode-extension/node_modules/**"
+  - "vscode-extension/out/**"
+  - "*.lock"
+  # Machine-generated or non-prose files. A six-field context block for a
+  # lockfile or a rendered diagram has no value, and they are large enough
+  # to be slow and to crowd out a small model's context window.
+  - "*.svg"
+  - "**/package-lock.json"
+
+ollama_model: "phi3:mini"
+
+# Ollama serialises requests unless OLLAMA_NUM_PARALLEL is raised, so a value
+# above 1 mostly multiplies each request's wall time rather than overlapping
+# real work.
+ollama_concurrency: 1
+
+# Per-request budget for one generation. phi3:mini on a laptop CPU regularly
+# needs well over a minute for a couple of kilobytes of source.
+ollama_timeout_secs: 300
+
+# Files larger than this are skipped rather than sent. phi3:mini's context
+# window is a few thousand tokens, so anything much bigger is truncated
+# server-side and answers slowly with nothing useful.
+ollama_max_bytes: 16384

@@ -1,0 +1,13 @@
+# Rust
+/target/
+Cargo.lock
+
+# VS Code extension build output
+vscode-extension/out/
+vscode-extension/node_modules/
+vscode-extension/*.vsix
+
+# Editor
+.vscode/settings.json
+*.swp
+*.orig

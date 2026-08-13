@@ -1,0 +1,72 @@
+{
+  "name": "llmctx",
+  "displayName": "llmctx",
+  "description": "Attach LLM context invisibly to your source files. Click to pack any file for pasting into any LLM.",
+  "version": "0.1.0",
+  "publisher": "llmctx",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "llmctx.pack",
+        "title": "llmctx: Pack current file to clipboard"
+      },
+      {
+        "command": "llmctx.reindex",
+        "title": "llmctx: Reindex current file (force Ollama regeneration)"
+      },
+      {
+        "command": "llmctx.openConfig",
+        "title": "llmctx: Open llmcontext.yaml"
+      }
+    ],
+    "configuration": {
+      "title": "llmctx",
+      "properties": {
+        "llmctx.daemonPort": {
+          "type": "number",
+          "default": 51515,
+          "description": "TCP port the llmctxd daemon listens on."
+        },
+        "llmctx.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "Ollama base URL (overrides llmcontext.yaml if set here)."
+        },
+        "llmctx.statusBarAlignment": {
+          "type": "string",
+          "enum": ["left", "right"],
+          "default": "right",
+          "description": "Which side of the status bar to show the llmctx indicator."
+        },
+        "llmctx.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the llmctx binary. Leave empty to use PATH resolution (recommended after running `cpctx setup`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

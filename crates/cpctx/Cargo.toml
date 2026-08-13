@@ -1,0 +1,20 @@
+[package]
+name        = "cpctx"
+description = "Context-preserving copy — copies files/directories and re-attaches llmctx ADS streams on the destination"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cpctx"
+path = "src/main.rs"
+
+[dependencies]
+llmctx-core         = { path = "../core" }
+clap                = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+thiserror           = { workspace = true }
+anyhow              = { workspace = true }

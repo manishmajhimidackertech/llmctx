@@ -1,0 +1,33 @@
+[package]
+name        = "llmctx-core"
+description = "Shared library: ADS I/O, Ollama client, config, extraction, process orchestration"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+rust-version.workspace = true
+
+[dependencies]
+tokio       = { workspace = true }
+reqwest     = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+serde_yaml  = { workspace = true }
+sha2        = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+anyhow      = { workspace = true }
+ignore      = { workspace = true }
+
+[dev-dependencies]
+# Used by the config/process unit tests. Previously missing, which made
+# `cargo test -p llmctx-core` fail to compile.
+tempfile = "3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.57", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_IO",
+] }
