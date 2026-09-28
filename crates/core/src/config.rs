@@ -134,9 +134,7 @@ impl ProjectConfig {
         let task = self.task.as_deref().unwrap_or("");
         let conventions = self.conventions.join(" | ");
 
-        format!(
-            "PROJECT: {project} | {stack}\nTASK: {task}\nCONVENTIONS: {conventions}\n"
-        )
+        format!("PROJECT: {project} | {stack}\nTASK: {task}\nCONVENTIONS: {conventions}\n")
     }
 }
 
@@ -163,9 +161,7 @@ pub fn find_config(start_dir: &Path) -> Result<PathBuf, ConfigError> {
 
 /// Convenience: find and parse config starting from the directory of `file_path`.
 pub fn load_config_for_file(file_path: &Path) -> Result<(PathBuf, ProjectConfig), ConfigError> {
-    let dir = file_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
     let config_path = find_config(dir)?;
     let config = load_config(&config_path)?;
     Ok((config_path, config))

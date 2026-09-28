@@ -277,7 +277,11 @@ impl OllamaClient {
         Err(OllamaError::InvalidOutput { detail: last })
     }
 
-    async fn generate_raw(&self, config: &ProjectConfig, prompt: &str) -> Result<String, OllamaError> {
+    async fn generate_raw(
+        &self,
+        config: &ProjectConfig,
+        prompt: &str,
+    ) -> Result<String, OllamaError> {
         let url = format!("{}/api/generate", resolve_ollama_url(config)?);
         let secs = config.ollama_timeout_secs_or_default();
 
@@ -482,7 +486,9 @@ mod tests {
     #[test]
     fn fenced_and_plain_text_answers_are_accepted() {
         let fenced = "```json\n{\"role\": \"Does\\nthings\"}\n```";
-        assert!(parse_generated(fenced, "a.rs").unwrap().contains("ROLE: Does things"));
+        assert!(parse_generated(fenced, "a.rs")
+            .unwrap()
+            .contains("ROLE: Does things"));
 
         let text = "Sure! Here it is:\nROLE: Handles auth\nEXPORTS: login()\n";
         let fields = parse_generated(text, "a.rs").unwrap();
@@ -506,13 +512,27 @@ mod tests {
             ollama_url: Some(url.into()),
             ..Default::default()
         };
-        assert_eq!(resolve_ollama_url(&ProjectConfig::default()).unwrap(), DEFAULT_OLLAMA_URL);
-        for ok in ["http://localhost:11434/", "http://127.0.0.1:9", "http://[::1]:11434"] {
+        assert_eq!(
+            resolve_ollama_url(&ProjectConfig::default()).unwrap(),
+            DEFAULT_OLLAMA_URL
+        );
+        for ok in [
+            "http://localhost:11434/",
+            "http://127.0.0.1:9",
+            "http://[::1]:11434",
+        ] {
             assert!(resolve_ollama_url(&with(ok)).is_ok(), "{ok}");
         }
-        for bad in ["https://attacker.example", "http://10.0.0.5:11434", "http://localhost.evil.com"] {
+        for bad in [
+            "https://attacker.example",
+            "http://10.0.0.5:11434",
+            "http://localhost.evil.com",
+        ] {
             assert!(
-                matches!(resolve_ollama_url(&with(bad)), Err(OllamaError::RemoteNotAllowed { .. })),
+                matches!(
+                    resolve_ollama_url(&with(bad)),
+                    Err(OllamaError::RemoteNotAllowed { .. })
+                ),
                 "{bad}"
             );
         }

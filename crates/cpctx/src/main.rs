@@ -86,7 +86,11 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Copy { source, dest, verbose } => cmd_copy(&source, &dest, verbose),
+        Command::Copy {
+            source,
+            dest,
+            verbose,
+        } => cmd_copy(&source, &dest, verbose),
         Command::Setup { bin_dir } => cmd_setup(bin_dir),
     }
 }
@@ -112,7 +116,10 @@ fn cmd_copy(source: &Path, dest: &Path, verbose: bool) -> Result<()> {
     // Phase 2: carry context across. This runs only after every file is in
     // place, so a copied llmcontext.yaml already marks the destination root.
     let carried = carry_context(&copied, verbose);
-    info!("copied {} file(s), carried context for {carried}", copied.len());
+    info!(
+        "copied {} file(s), carried context for {carried}",
+        copied.len()
+    );
     Ok(())
 }
 

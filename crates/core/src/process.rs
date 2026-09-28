@@ -248,7 +248,10 @@ pub async fn process_file(
                 // show up as a change in everyone's working tree, so store it
                 // and leave the file alone.
                 store.put(&rel_path, &hash, "llm", &fields)?;
-                info!(?path, "<<<LLMCTX block is committed in git — stored, left in file");
+                info!(
+                    ?path,
+                    "<<<LLMCTX block is committed in git — stored, left in file"
+                );
                 return Ok(ProcessResult {
                     source: ProcessSource::ExtractedKept,
                     context: Some(fields),
@@ -281,7 +284,11 @@ pub async fn process_file(
         }
 
         Step::Generate => {
-            info!(?path, bytes = source.len(), "calling Ollama for context generation");
+            info!(
+                ?path,
+                bytes = source.len(),
+                "calling Ollama for context generation"
+            );
             let generated = client.generate(&config, &rel_path, &source).await?;
             // The Ollama branch leaves the file untouched, so the hash is of
             // `source`.
@@ -382,7 +389,10 @@ fn prepare(path: &Path, opts: ProcessOptions) -> Result<Prepared, ProcessError> 
         });
         match lookup {
             Ok(Lookup::Current(_)) => {
-                debug!(?path, "stored context already current for this content — skipping");
+                debug!(
+                    ?path,
+                    "stored context already current for this content — skipping"
+                );
                 return Ok(ready(Step::UpToDate));
             }
             Ok(Lookup::Found(donor)) => return Ok(ready(Step::Reuse(donor))),
@@ -400,7 +410,10 @@ fn prepare(path: &Path, opts: ProcessOptions) -> Result<Prepared, ProcessError> 
             }
             Err(e) => {
                 // Block was found but is malformed.  Log and fall through.
-                warn!(?path, "malformed <<<LLMCTX block ({e}) — falling back to Ollama");
+                warn!(
+                    ?path,
+                    "malformed <<<LLMCTX block ({e}) — falling back to Ollama"
+                );
             }
         }
     }

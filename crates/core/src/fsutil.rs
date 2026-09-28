@@ -107,7 +107,10 @@ mod tests {
 
         replace_file(&link, b"echo new").unwrap();
 
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(fs::read_to_string(&real).unwrap(), "echo new");
         let mode = fs::metadata(&real).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);

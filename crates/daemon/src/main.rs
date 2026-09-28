@@ -7,12 +7,7 @@
 // NOTES: One process per user; OS-assigned port published with a token in the per-user discovery file; concurrency per Ollama server from config
 // LLMCTX>>>
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -207,7 +202,10 @@ async fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let file = runtime::write_daemon_info(&info).context("could not write the discovery file")?;
-    info!("llmctxd listening on 127.0.0.1:{port} (discovery file: {})", file.display());
+    info!(
+        "llmctxd listening on 127.0.0.1:{port} (discovery file: {})",
+        file.display()
+    );
 
     let daemon = Arc::new(Daemon {
         client: OllamaClient::new(),
@@ -343,11 +341,13 @@ async fn handle_connection(stream: TcpStream, daemon: Arc<Daemon>) -> Result<()>
                     Err(e) => warn!("{from} → {to}: could not move context: {e}"),
                 }
             }
-            Ok(InboundMessage::Delete { path }) => match store::forget_context(&PathBuf::from(&path)) {
-                Ok(0) => {}
-                Ok(n) => info!("{path}: deleted — dropped context for {n} file(s)"),
-                Err(e) => warn!("{path}: could not drop context: {e}"),
-            },
+            Ok(InboundMessage::Delete { path }) => {
+                match store::forget_context(&PathBuf::from(&path)) {
+                    Ok(0) => {}
+                    Ok(n) => info!("{path}: deleted — dropped context for {n} file(s)"),
+                    Err(e) => warn!("{path}: could not drop context: {e}"),
+                }
+            }
             Ok(InboundMessage::Hello { .. }) => {}
             Err(e) => warn!("unrecognised message: {e} — raw: {line}"),
         }
@@ -589,7 +589,8 @@ mod tests {
 
     #[test]
     fn protocol_messages_round_trip() {
-        let hello: InboundMessage = serde_json::from_str(r#"{"type":"hello","token":"t"}"#).unwrap();
+        let hello: InboundMessage =
+            serde_json::from_str(r#"{"type":"hello","token":"t"}"#).unwrap();
         assert!(matches!(hello, InboundMessage::Hello { token } if token == "t"));
         let rename: InboundMessage =
             serde_json::from_str(r#"{"type":"rename","from":"a","to":"b"}"#).unwrap();

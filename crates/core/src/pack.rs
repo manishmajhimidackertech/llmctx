@@ -91,12 +91,12 @@ pub fn pack(path: &Path, with_imports: bool) -> Result<Packed, ProcessError> {
             out.push_str(&c.fields);
             out.push('\n');
             if c.stale {
-                out.push_str(
-                    "(This context was generated from an earlier version of the file.)\n",
-                );
+                out.push_str("(This context was generated from an earlier version of the file.)\n");
             }
         }
-        None => out.push_str("[no context yet — daemon may still be generating, try again shortly]\n"),
+        None => {
+            out.push_str("[no context yet — daemon may still be generating, try again shortly]\n")
+        }
     }
 
     if with_imports {
@@ -118,7 +118,10 @@ pub fn pack(path: &Path, with_imports: bool) -> Result<Packed, ProcessError> {
 /// project header. A compact overview to start an LLM session with.
 pub fn project_map(root: &Path) -> Result<String, ProcessError> {
     let config = config::load_config(&root.join(config::CONFIG_FILENAME)).unwrap_or_default();
-    let mut out = format!("=== PROJECT ===\n{}\n=== FILES ===\n", config.header_block());
+    let mut out = format!(
+        "=== PROJECT ===\n{}\n=== FILES ===\n",
+        config.header_block()
+    );
     let Some(store) = ContextStore::open_existing(root)? else {
         out.push_str("(no stored context yet — run `llmctx index`)\n");
         return Ok(out);
@@ -232,9 +235,17 @@ mod tests {
         let (dir, store) = project();
         let file = write(&dir, "a.py", "x = 1\n");
         store
-            .put("a.py", &content_hash("x = 1\n"), "llm", "FILE: a.py\nROLE: r")
+            .put(
+                "a.py",
+                &content_hash("x = 1\n"),
+                "llm",
+                "FILE: a.py\nROLE: r",
+            )
             .unwrap();
-        assert!(pack(&file, false).unwrap().text.contains("TASK: first task"));
+        assert!(pack(&file, false)
+            .unwrap()
+            .text
+            .contains("TASK: first task"));
 
         // Editing the config changes every pack immediately — nothing stale.
         fs::write(
@@ -275,7 +286,8 @@ mod tests {
         assert!(util_ctx.fields.contains("USED BY: app.py"));
 
         let packed = pack(&app, true).unwrap().text;
-        assert!(packed.contains("=== CONTEXT: lib/util.py (imported) ===\nFILE: lib/util.py\nROLE: helpers"));
+        assert!(packed
+            .contains("=== CONTEXT: lib/util.py (imported) ===\nFILE: lib/util.py\nROLE: helpers"));
     }
 
     #[test]
@@ -283,7 +295,12 @@ mod tests {
         let (dir, store) = project();
         let file = write(&dir, "a.py", "changed\n");
         store
-            .put("a.py", &content_hash("original\n"), "llm", "FILE: a.py\nROLE: r")
+            .put(
+                "a.py",
+                &content_hash("original\n"),
+                "llm",
+                "FILE: a.py\nROLE: r",
+            )
             .unwrap();
         let packed = pack(&file, false).unwrap();
         assert!(packed.has_context);
@@ -298,8 +315,12 @@ mod tests {
     #[test]
     fn map_and_search() {
         let (dir, store) = project();
-        store.put("a.py", "1", "llm", "FILE: a.py\nROLE: Parses tokens").unwrap();
-        store.put("b.py", "2", "llm", "FILE: b.py\nROLE: Renders HTML").unwrap();
+        store
+            .put("a.py", "1", "llm", "FILE: a.py\nROLE: Parses tokens")
+            .unwrap();
+        store
+            .put("b.py", "2", "llm", "FILE: b.py\nROLE: Renders HTML")
+            .unwrap();
         let map = project_map(dir.path()).unwrap();
         assert!(map.contains("a.py — Parses tokens\nb.py — Renders HTML\n"));
         let hits = search(dir.path(), "html").unwrap();

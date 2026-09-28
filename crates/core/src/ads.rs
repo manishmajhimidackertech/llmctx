@@ -116,9 +116,8 @@ mod windows_impl {
     use windows::{
         core::HSTRING,
         Win32::Storage::FileSystem::{
-            CreateFileW, DeleteFileW, ReadFile, WriteFile,
-            FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_SHARE_READ, OPEN_ALWAYS, OPEN_EXISTING,
+            CreateFileW, DeleteFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, OPEN_ALWAYS, OPEN_EXISTING,
         },
     };
 
@@ -171,11 +170,12 @@ mod windows_impl {
         let mut buf = vec![0u8; 65536];
         let mut bytes_read: u32 = 0;
         unsafe {
-            ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None)
-                .map_err(|e| AdsError::Io {
+            ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None).map_err(|e| {
+                AdsError::Io {
                     path: sp.clone(),
                     source: std::io::Error::from_raw_os_error(e.code().0),
-                })?;
+                }
+            })?;
             windows::Win32::Foundation::CloseHandle(handle).ok();
         }
 
@@ -186,11 +186,7 @@ mod windows_impl {
         let raw = String::from_utf8_lossy(&buf[..bytes_read as usize]).into_owned();
         validate_version(&raw, &sp)?;
         // Strip the version line before returning so callers see only the body.
-        let body = raw
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = raw.lines().skip(1).collect::<Vec<_>>().join("\n");
         Ok(body)
     }
 
@@ -224,11 +220,10 @@ mod windows_impl {
 
         let mut written: u32 = 0;
         unsafe {
-            WriteFile(handle, Some(bytes), Some(&mut written), None)
-                .map_err(|e| AdsError::Io {
-                    path: sp.clone(),
-                    source: std::io::Error::from_raw_os_error(e.code().0),
-                })?;
+            WriteFile(handle, Some(bytes), Some(&mut written), None).map_err(|e| AdsError::Io {
+                path: sp.clone(),
+                source: std::io::Error::from_raw_os_error(e.code().0),
+            })?;
             windows::Win32::Foundation::CloseHandle(handle).ok();
         }
         Ok(())

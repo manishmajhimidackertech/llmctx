@@ -47,7 +47,11 @@ pub struct DaemonInfo {
 /// Directory holding the discovery file, or `None` if no suitable
 /// per-user location can be determined.
 pub fn runtime_dir() -> Option<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let env = |k: &str| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
     if let Some(dir) = env(RUNTIME_DIR_ENV) {
         return Some(dir);
     }
@@ -121,7 +125,10 @@ pub fn tokens_match(expected: &str, given: &str) -> bool {
 #[cfg(unix)]
 fn create_private_dir(dir: &std::path::Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
     // Tighten an existing directory too.
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }

@@ -137,7 +137,11 @@ pub fn extract_llmctx_block(source: &str) -> Result<ExtractedContext, ExtractErr
     // Re-join with the file's own line ending. `lines()` drops the `\r` of
     // every `\r\n`, and writing plain `\n` back would turn a one-block edit
     // into a whole-file diff on Windows checkouts.
-    let eol = if source.contains("\r\n") { "\r\n" } else { "\n" };
+    let eol = if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut cleaned_source = remaining.join(eol);
     // Preserve a trailing newline if the original had one.
     if source.ends_with('\n') && !cleaned_source.is_empty() {
@@ -198,9 +202,7 @@ pub fn strip_comment_prefix(line: &str) -> &str {
     let trimmed = line.trim_start();
 
     // Try each prefix in longest-first order so `<!-- ` beats `<`.
-    const PREFIXES: &[&str] = &[
-        "<!-- ", "<!---", "// ", "# ", "/* ", " * ", "* ", "//", "#",
-    ];
+    const PREFIXES: &[&str] = &["<!-- ", "<!---", "// ", "# ", "/* ", " * ", "* ", "//", "#"];
     for prefix in PREFIXES {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return rest;
@@ -333,7 +335,10 @@ pass
     fn block_below_other_content_is_ignored() {
         // Documentation that shows the format (like docs/llmctx.md) must never
         // be rewritten: only a block at the very top of a file is a block.
-        let doc = format!("# The format\n\nExample:\n\n```python\n{}```\n", python_block());
+        let doc = format!(
+            "# The format\n\nExample:\n\n```python\n{}```\n",
+            python_block()
+        );
         assert!(matches!(
             extract_llmctx_block(&doc),
             Err(ExtractError::NoDelimiter)
@@ -342,9 +347,14 @@ pass
 
     #[test]
     fn block_after_shebang_and_attributes_is_found() {
-        let src = format!("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n{}", python_block());
+        let src = format!(
+            "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n{}",
+            python_block()
+        );
         let result = extract_llmctx_block(&src).unwrap();
-        assert!(result.cleaned_source.starts_with("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\ndef verify_token"));
+        assert!(result
+            .cleaned_source
+            .starts_with("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\ndef verify_token"));
 
         let rust = format!("#![allow(dead_code)]\n\n{}", js_block());
         assert!(extract_llmctx_block(&rust).is_ok());

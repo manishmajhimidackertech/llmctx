@@ -173,9 +173,7 @@ async fn main() -> Result<()> {
         } => cmd_pack(&file, stdout, with_imports)?,
         Command::Map { dir, copy } => cmd_map(&dir, copy)?,
         Command::Reindex { file } => cmd_reindex(&file, Arc::clone(&client)).await?,
-        Command::Extract { file, force } => {
-            cmd_extract(&file, Arc::clone(&client), force).await?
-        }
+        Command::Extract { file, force } => cmd_extract(&file, Arc::clone(&client), force).await?,
         Command::Migrate {
             dir,
             remove_streams,
@@ -241,8 +239,7 @@ llmctx_ignore:
 # ollama_num_ctx: 7168
 "##;
 
-    std::fs::write(dest, template)
-        .with_context(|| format!("failed to write {CONFIG_FILENAME}"))?;
+    std::fs::write(dest, template).with_context(|| format!("failed to write {CONFIG_FILENAME}"))?;
     println!("Created {CONFIG_FILENAME} — edit it, then run `llmctx index`.");
     Ok(())
 }
@@ -270,7 +267,8 @@ fn project_walker(dir: &Path, config_path: &Path, config: &ProjectConfig) -> Res
 
     // Add llmctx_ignore patterns as overrides.
     // `ignore` crate supports adding override globs directly.
-    let mut overrides = ignore::overrides::OverrideBuilder::new(config_path.parent().unwrap_or(dir));
+    let mut overrides =
+        ignore::overrides::OverrideBuilder::new(config_path.parent().unwrap_or(dir));
     for pattern in &config.llmctx_ignore {
         // Prefix with `!` to turn them into ignore patterns (OverrideBuilder
         // treats un-prefixed patterns as whitelist; `!` means exclude).
@@ -299,9 +297,9 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
         Ok(models) => {
             let want = config.ollama_model_or_default();
             // Ollama reports tags as `name:tag`; a bare `name` means `:latest`.
-            let have = models.iter().any(|m| {
-                m == want || m.strip_suffix(":latest").is_some_and(|base| base == want)
-            });
+            let have = models
+                .iter()
+                .any(|m| m == want || m.strip_suffix(":latest").is_some_and(|base| base == want));
             if !have {
                 warn!(
                     "model '{want}' is not installed (found: {}). Run `ollama pull {want}` — \

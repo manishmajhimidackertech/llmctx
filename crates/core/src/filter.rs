@@ -183,7 +183,11 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::write(repo.join(".gitignore"), "generated/\n").unwrap();
         let project = repo.join("app");
-        assert!(is_ignored(&project, &touch(&project, "generated/x.rs"), &[]));
+        assert!(is_ignored(
+            &project,
+            &touch(&project, "generated/x.rs"),
+            &[]
+        ));
         assert!(!is_ignored(&project, &touch(&project, "src/x.rs"), &[]));
     }
 
@@ -191,10 +195,18 @@ mod tests {
     fn llmctx_ignore_patterns_apply_to_files_and_directories() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let patterns = vec!["vendor/**".to_string(), "*.svg".to_string(), "docs".to_string()];
+        let patterns = vec![
+            "vendor/**".to_string(),
+            "*.svg".to_string(),
+            "docs".to_string(),
+        ];
         assert!(is_ignored(root, &touch(root, "vendor/a/b.rs"), &patterns));
         assert!(is_ignored(root, &touch(root, "img/logo.svg"), &patterns));
-        assert!(is_ignored(root, &touch(root, "docs/guide/intro.md"), &patterns));
+        assert!(is_ignored(
+            root,
+            &touch(root, "docs/guide/intro.md"),
+            &patterns
+        ));
         assert!(!is_ignored(root, &touch(root, "src/a.rs"), &patterns));
     }
 

@@ -319,7 +319,14 @@ impl ContextStore {
             self.conn
                 .execute(
                     "INSERT OR REPLACE INTO context VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![rel_path, hash, legacy.source, legacy.fields, version, updated_at],
+                    params![
+                        rel_path,
+                        hash,
+                        legacy.source,
+                        legacy.fields,
+                        version,
+                        updated_at
+                    ],
                 )
                 .map_err(self.err())?;
         }
@@ -868,7 +875,10 @@ pub fn parse_legacy_body(body: &str) -> LegacyBody {
     let source = field_value(body, "SOURCE").unwrap_or("llm").to_string();
     let hash = field_value(body, "HASH").unwrap_or("").to_string();
     let lines: Vec<&str> = body.lines().collect();
-    let fields = match lines.iter().position(|l| l.trim_start().starts_with("FILE:")) {
+    let fields = match lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("FILE:"))
+    {
         Some(start) => lines[start..].join("\n"),
         None => lines
             .iter()
@@ -991,7 +1001,9 @@ mod tests {
     }
 
     fn fields(file: &str) -> String {
-        format!("FILE: {file}\nROLE: r\nEXPORTS: NONE\nIMPORTS: NONE\nUSED BY: UNKNOWN\nNOTES: NONE")
+        format!(
+            "FILE: {file}\nROLE: r\nEXPORTS: NONE\nIMPORTS: NONE\nUSED BY: UNKNOWN\nNOTES: NONE"
+        )
     }
 
     #[test]
@@ -1171,8 +1183,12 @@ mod tests {
         let other = TempDir::new().unwrap();
         fs::write(other.path().join(config::CONFIG_FILENAME), "project: O\n").unwrap();
         let store = ContextStore::open(outer.path()).unwrap();
-        store.put("dir/a.rs", "h", "llm", &fields("dir/a.rs")).unwrap();
-        store.put("dir/b.rs", "h2", "llm", &fields("dir/b.rs")).unwrap();
+        store
+            .put("dir/a.rs", "h", "llm", &fields("dir/a.rs"))
+            .unwrap();
+        store
+            .put("dir/b.rs", "h2", "llm", &fields("dir/b.rs"))
+            .unwrap();
 
         // Rename inside the project (paths as an editor reports them).
         let moved = move_context(&outer.path().join("dir"), &outer.path().join("lib")).unwrap();

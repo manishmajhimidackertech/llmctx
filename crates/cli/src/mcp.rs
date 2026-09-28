@@ -293,7 +293,11 @@ mod tests {
     #[test]
     fn paths_outside_the_root_are_refused() {
         let (_dir, server) = server();
-        let r = call(&server, "get_file_context", json!({"path":"../../etc/passwd"}));
+        let r = call(
+            &server,
+            "get_file_context",
+            json!({"path":"../../etc/passwd"}),
+        );
         assert_eq!(r["isError"], true);
     }
 }
