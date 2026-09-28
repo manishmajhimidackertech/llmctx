@@ -68,11 +68,11 @@ candidate since it looks like a runtime/output directory rather than source.
 
 ---
 
-## 2. Start the daemon
+## 2. Check Ollama (the daemon starts itself)
 
-Before starting the daemon, make sure Ollama is actually installed, running, **and** has
-a model pulled — installing Ollama alone isn't enough, the model download is a separate
-step (`ollama pull phi3:mini`). See
+Make sure Ollama is actually installed, running, **and** has a model pulled. Installing
+Ollama alone isn't enough: the model download is a separate step
+(`ollama pull phi3:mini`). See
 [Installing Ollama](../README.md#installing-ollama-step-by-step) in the README if you
 haven't done this yet. A quick check:
 
@@ -80,16 +80,14 @@ haven't done this yet. A quick check:
 ollama list
 ```
 
-If that doesn't show a model, `llmctxd` will still start fine, but every file will end up
-in `error` state until you pull one.
+If that doesn't show a model, everything else still works, but files that need Ollama end
+up in `error` state until you pull one.
 
-```powershell
-llmctxd
-```
-
-Leave this running in a terminal, or register it with Task Scheduler so it starts
-automatically at login (see the README's Installation section, step 4). The VS Code
-extension talks to it over a local TCP socket — nothing happens until it's running.
+You don't need to start `llmctxd` yourself: when you open CodeA4 in VS Code, the extension
+starts it in the background if it isn't already running, and connects to it using the
+port and token the daemon publishes in your per-user discovery file. The status bar item
+shows `$(plug) llmctx` until it's connected. If you turned `llmctx.autoStartDaemon` off,
+run `llmctxd` in a terminal instead.
 
 ---
 
@@ -104,9 +102,9 @@ llmctx index
 ```
 
 This walks every file under the project root (respecting `.gitignore` and your
-`llmctx_ignore` patterns), and for each one:
+`llmctx_ignore` patterns, and skipping hidden files like `.env`), and for each one:
 
-- If it already has an `<<<LLMCTX` block, extracts it immediately.
+- If it starts with an `<<<LLMCTX` block, extracts it immediately.
 - Otherwise, sends it to your local Ollama model to generate one.
 
 For a project the size of CodeA4's `backend/`, expect this to take a minute or two the
@@ -123,8 +121,15 @@ gets written:
 ### You hand-edit a file
 
 Open `backend/pipeline/render_svg.py`, make a change, save. The status bar shows
-`$(sync~spin)` for up to 30 seconds (the daemon debounces in case you're still typing),
-then calls Ollama and updates to `$(check)` once the context is regenerated.
+`$(clock)` for 30 seconds (the daemon debounces in case you're still typing), then
+`$(sync~spin)` while Ollama works, and `$(check)` once the new context is stored. Saving
+a file without changing it goes straight to `$(check)`.
+
+Files llmctx deliberately leaves alone (ignored, hidden, too small, too large, binary)
+show `$(circle-slash)`; hover it to see why.
+
+Renaming or moving a file in VS Code's Explorer carries its context along, even if you
+also edit it.
 
 ### An LLM writes a file for you
 
@@ -156,10 +161,12 @@ llmctx pack backend\jobs\render_jobs.py
 Either way, what lands on the clipboard looks like:
 
 ```
-=== CONTEXT ===
-PROJECT: CodeA4
-STACK: Python, Flask-style app.py/api/jobs, Docker Compose, ...
+=== PROJECT ===
+PROJECT: CodeA4 | Python, Flask-style app.py/api/jobs, Docker Compose, ...
 TASK: Building the code-clustering render pipeline
+CONVENTIONS: API route handlers live under backend/api/, ... | Background work goes through backend/jobs/, ...
+
+=== CONTEXT: backend/jobs/render_jobs.py ===
 FILE: backend/jobs/render_jobs.py
 ROLE: Dispatches SVG/PDF render jobs to the pipeline and updates job status
 EXPORTS: enqueue_render_job(), render_worker()
@@ -172,7 +179,22 @@ NOTES: Runs inside the Celery-style worker.py process, not the web process
 ```
 
 The LLM gets the full picture in one paste — no separate "let me explain the codebase"
-message needed.
+message needed. The PROJECT/TASK lines always come from today's `llmcontext.yaml`, so
+changing `task:` shows up in the very next pack. `USED BY` lists the files whose own
+context names this one in `IMPORTS`.
+
+Two more ways to hand context over:
+
+- **Pack current file with the context of its imports** (Command Palette, or
+  `llmctx pack <file> --with-imports`) adds the context — not the source — of every
+  project file it imports, so the LLM knows what `render_svg.py` and `pdf_export.py` do
+  without you pasting them.
+- **Copy project map to clipboard** (or `llmctx map`) gives one line per file with its
+  role: a compact way to open a new chat about the whole project.
+
+If you use Claude Code or another MCP client, skip the clipboard entirely: register
+`llmctx mcp` once (`claude mcp add llmctx -- llmctx mcp` from the CodeA4 root) and the
+assistant can look up `project_map`, `get_file_context` and `search_context` itself.
 
 ---
 
@@ -236,8 +258,17 @@ the project root to move that context into the store instead of regenerating it.
 - **Context missing entirely after a copy** — the `.llmctx\` folder didn't come along.
   Either the files were copied without the project root (use `cpctx copy` for that), or
   the project came from `git clone`. Run `llmctx index` at the destination.
-- **Stale entries for deleted or renamed files** — run `llmctx gc` in the project to
-  remove context for files that no longer exist.
+- **Stale entries for deleted or renamed files** — the next `llmctx index` removes them;
+  `llmctx gc` does just that step.
+- **`refusing to send source to …`** — `ollama_url` in `llmcontext.yaml` points at another
+  machine, which a repository's config isn't allowed to do. Set `LLMCTX_OLLAMA_URL` (or
+  `llmctx.ollamaUrl` in your VS Code user settings) instead.
+- **Status bar stuck on `$(plug) llmctx`** — the extension can't reach the daemon. If it
+  said it couldn't start `llmctxd`, put the binary on your PATH or set
+  `llmctx.daemonPath`.
+- **A block stayed in the file** — it's committed in git, so llmctx stored it but left it
+  in place rather than change everyone's working tree. Remove it in a commit if you'd
+  rather it lived only in the store.
 - **A source fix seems to have had no effect** — you almost certainly did not
   rebuild, or rebuilt but left an older binary earlier on your PATH. Confirm with
   `where.exe llmctx`, and check that `llmctx index`'s first log line ends with

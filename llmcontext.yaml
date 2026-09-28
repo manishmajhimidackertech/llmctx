@@ -1,12 +1,14 @@
 project: "llmctx"
 stack: "Rust (tokio, reqwest, clap, serde, sha2, ignore), TypeScript (VS Code extension API)"
-task: "Build and ship v0.1.0 — core crate, daemon, CLI, VS Code extension"
+task: "Ship the filesystem-independent store: .llmctx/ SQLite, daemon auth, MCP server, CI"
 
 conventions:
   - "No unwrap() in library code — use thiserror + anyhow at boundaries"
   - "Every public async fn returns a typed Result; never panics"
   - "process_file() is the single authoritative decision fn — daemon and CLI never reimplement its branch logic"
-  - "Context is only written through store.rs (ContextStore::put); nothing else touches .llmctx/"
+  - "Context is only written through store.rs (ContextStore); nothing else touches .llmctx/"
+  - "Only the six per-file fields are stored; the project header and USED BY are computed at read time (pack.rs)"
+  - "Repo config must never widen where code is sent: ollama_url is local-only, remote needs LLMCTX_OLLAMA_URL"
   - "LLMCTX comment blocks are invisible infrastructure — do not narrate them to users"
 
 llmctx_ignore:
