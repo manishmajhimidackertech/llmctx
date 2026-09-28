@@ -1,11 +1,15 @@
 // <<<LLMCTX
 // FILE: crates/core/src/ads.rs
-// ROLE: Read and write the file:llmctx NTFS Alternate Data Stream on Windows
+// ROLE: Legacy reader/writer for the file:llmctx NTFS Alternate Data Stream, kept for `llmctx migrate`
 // EXPORTS: read_ads(), write_ads(), ads_exists(), clear_ads(), AdsError
 // IMPORTS: NONE
-// USED BY: crates/core/src/process.rs, crates/cli/src/main.rs
+// USED BY: crates/cli/src/main.rs
 // NOTES: Windows/NTFS only — every public function returns Err(AdsError::NotSupported) on non-Windows
 // LLMCTX>>>
+
+//! Where llmctx used to keep context before the project store
+//! (`store.rs`) replaced it. Nothing writes here any more; `llmctx migrate`
+//! reads existing streams into the store and can optionally remove them.
 
 use thiserror::Error;
 

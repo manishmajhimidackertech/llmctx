@@ -1,10 +1,10 @@
 // <<<LLMCTX
 // FILE: vscode-extension/src/pack.ts
-// ROLE: Read ADS context via the CLI and merge it with source text for clipboard paste
+// ROLE: Read stored context via the CLI and merge it with source text for clipboard paste
 // EXPORTS: packFile(), reindexFile(), verifyCliOnPath()
 // IMPORTS: NONE
 // USED BY: vscode-extension/src/extension.ts
-// NOTES: Shells out to `llmctx pack` which handles the ADS read; detects missing binary with clear guidance
+// NOTES: Shells out to `llmctx pack` which reads the .llmctx store; detects missing binary with clear guidance
 // LLMCTX>>>
 
 import * as vscode from "vscode";
@@ -80,8 +80,8 @@ export async function verifyCliOnPath(): Promise<void> {
 /**
  * Pack the file at `filePath` to the system clipboard via `llmctx pack`.
  *
- * The CLI binary owns the ADS read logic so we shell out to it rather than
- * reimplementing ADS access in TypeScript.
+ * The CLI binary owns the context-store read logic so we shell out to it
+ * rather than reimplementing SQLite access in TypeScript.
  */
 export async function packFile(filePath: string): Promise<void> {
   await vscode.window.withProgress(

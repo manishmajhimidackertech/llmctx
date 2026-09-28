@@ -37,6 +37,9 @@ thiserror    = "1"
 anyhow       = "1"
 # gitignore walking
 ignore       = "0.4"
+# Embedded SQLite for the project context store (.llmctx/context.db).
+# `bundled` compiles SQLite in, so users never install it separately.
+rusqlite     = { version = "0.32", features = ["bundled"] }
 # Bounded async channel used by llmctx index for streaming file walker
 async-channel = "2"
 # Windows ADS crate is declared in each crate that uses it (crates/core/Cargo.toml)

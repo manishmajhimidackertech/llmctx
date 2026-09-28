@@ -12,6 +12,14 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "configurationDefaults": {
+      "files.exclude": {
+        "**/.llmctx": true
+      },
+      "files.watcherExclude": {
+        "**/.llmctx/**": true
+      }
+    },
     "commands": [
       {
         "command": "llmctx.pack",

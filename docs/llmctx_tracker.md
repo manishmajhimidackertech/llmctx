@@ -8,9 +8,11 @@
 
 A developer tool that eliminates the need to re-explain your codebase every time you start a new LLM chat session.
 
-**Core idea:** Attach LLM context invisibly to each source file using NTFS Alternate Data Streams (ADS) as local storage. Context is generated automatically on every save by a local Ollama model running in the background. When you want to send a file to any LLM, click the llmctx button in the VS Code status bar — it reads the ADS and source, merges them into one plain text block, and copies to clipboard. You paste into any LLM. Zero terminal, zero commands, zero re-explaining.
+**Core idea:** Attach LLM context invisibly to each source file, kept in llmctx's own per-project store: one SQLite database at `<project root>/.llmctx/context.db`, which works on any file system. Context is generated automatically on every save by a local Ollama model running in the background. When you want to send a file to any LLM, click the llmctx button in the VS Code status bar. It reads the stored context and the source, merges them into one plain text block, and copies it to the clipboard. You paste into any LLM. Zero terminal, zero commands, zero re-explaining.
 
-> **Important:** LLMs (including Claude) cannot read ADS directly. ADS is purely local invisible storage. The VS Code status bar button is the only bridge between ADS and any LLM. Never upload raw files directly.
+> **Important:** LLMs (including Claude) cannot read the store directly. It is purely local storage. The VS Code status bar button is the only bridge between the store and any LLM. Never upload raw files directly.
+
+> **History:** v0.1 stored context in NTFS Alternate Data Streams (`file.py:llmctx`). That limited llmctx to Windows/NTFS, and most copy, sync and archive tools silently dropped the streams. The store replaced it; see "Storage redesign" below. `ads.rs` survives only so `llmctx migrate` can read old streams.
 
 ---
 
@@ -24,26 +26,29 @@ A developer tool that eliminates the need to re-explain your codebase every time
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Context storage | NTFS ADS (`file.py:llmctx`) | Zero clutter, invisible, git-ignored by design. Local only — LLMs cannot read ADS directly |
+| Context storage | **Per-project SQLite store at `<root>/.llmctx/context.db`** (was NTFS ADS in v0.1) | Works on every OS and file system; one file that travels with the project folder; transactional; safe for daemon + CLI concurrently. `.llmctx/.gitignore` = `*`, so it ignores itself |
 | LLM delivery | VS Code status bar button | User clicks, merged text lands in clipboard. Zero terminal needed |
-| Platform scope | Windows / NTFS only (v1) | ADS is NTFS-native, cross-platform later |
+| Platform scope | **Any OS, any file system** | The store is an ordinary file; no NTFS features needed |
+| Project root | Nearest `llmcontext.yaml`, else nearest existing `.llmctx/` or `.git` | Files outside any project are skipped, so `.llmctx/` is never scattered next to stray files |
+| Store keys | Root-relative `/`-separated path, plus content hash as secondary key | The hash lets renamed/moved/copied files keep their context without calling Ollama (what ADS gave for free) |
 | LLM for generation | Ollama (local) | Free, private, no API cost, runs in background |
 | Architecture | Daemon + CLI + VS Code extension + cpctx | Decoupled, editor-agnostic daemon |
 | Context generation | Ollama auto-generates on save | Zero manual work for the user |
-| Git behaviour | ADS not tracked by git | Feature, not a bug. Devs run `llmctx index` after clone |
+| Git behaviour | Store not tracked by git (self-ignoring `.llmctx/`) | Feature, not a bug. Devs run `llmctx index` after clone |
 | Trigger | VS Code extension notifies daemon on file save | Extension stays thin, daemon does all work |
 | Daemon + CLI language | **Rust** | Single `.exe`, no runtime deps, tiny memory footprint, great for background daemon |
 | VS Code extension language | **TypeScript** | Non-negotiable — VS Code extension API requirement |
 | Distribution | **GitHub Releases** | Daemon `.exe` + CLI `.exe` + cpctx `.exe` published as release artifacts; VS Code extension via Marketplace. **Backlog: Windows code-signing cert before public launch** |
 | Project name | **llmctx** | Final |
-| Context for LLM-generated files | **Comment-block extraction**, not Ollama | LLM writes context as a delimited comment at the top of the file it generates (taught via `llmctx.md` skill file). Daemon/CLI detects it, cuts it into ADS, strips it from source. Ollama is never called for these files |
+| Context for LLM-generated files | **Comment-block extraction**, not Ollama | LLM writes context as a delimited comment at the top of the file it generates (taught via `llmctx.md` skill file). Daemon/CLI detects it, writes it to the store, then strips it from source. Ollama is never called for these files |
 | Concurrent saves | **Bounded worker pool for Ollama** (default 2 concurrent jobs) | Mass save must never spawn unbounded local-model inference |
 | `llmctx init` | **Non-interactive template drop** | Writes `llmcontext.yaml` with placeholder comments and exits immediately |
-| ADS format versioning | **`LLMCTX_VERSION: 1` as the first line of every write** | Prevents silent incompatibility later. Mismatch on read → silently regenerate |
-| Uninstall behaviour | **Leave ADS streams in place, no cleanup pass** | Orphaned ADS is invisible and harmless |
+| Context format versioning | **`version` column on every row (`CONTEXT_VERSION = 1`); table layout in `PRAGMA user_version`** | Mismatched rows read as missing → silently regenerate. A store from a newer llmctx is refused rather than misread |
+| Uninstall behaviour | **Delete `.llmctx/`** | Everything in it can be rebuilt by `llmctx index` |
+| Migration from v0.1 | **`llmctx migrate [--remove-streams]`** | Explicit, idempotent import of ADS context into the store; never overwrites newer store rows |
 | `llmctx.md` for non-Claude LLMs | **Out of scope for v1** | Targets Claude/Claude Code specifically for now |
 | Auto-update | **Passive check on daemon startup only** | One-time GitHub Releases check, never auto-replaces running `.exe` |
-| Copying files | **`cpctx` — context-preserving copy tool** | Solves the "normal copy strips ADS" problem. `cpctx copy` reads ADS from source and writes it to destination after every file copy. `cpctx setup` registers itself on the user PATH permanently (no admin required) |
+| Copying files | **`cpctx` — context-preserving copy tool** | Whole-project copies need nothing (the store is inside the folder). `cpctx copy` is for copying files into a *different* project: it copies bytes first, then carries each file's context from the source store to the destination store. `cpctx setup` registers itself on the user PATH permanently (no admin required) |
 
 ---
 
@@ -51,21 +56,22 @@ A developer tool that eliminates the need to re-explain your codebase every time
 
 ### crates/core (shared library) ✅
 - **`lib.rs`** — re-exports all public modules
-- **`ads.rs`** — ADS read/write via `windows-rs` with version stamp (`LLMCTX_VERSION: 1`). Non-Windows stub returns `AdsError::NotSupported` gracefully. Functions: `read_ads()`, `write_ads()`, `ads_exists()`, `clear_ads()`
+- **`store.rs`** — the context store. `ContextStore` (open / open_existing / open_for_file, get, put, remove, lookup, prune_missing), `StoreSet` (one open store per root for multi-file commands), `project_root()`, `retarget_body()`. `lookup()` returns `Current | Adopted | Stale | Missing`; `Adopted` is the rename/copy carry-over by content hash, and drops the donor row when its file is gone
+- **`ads.rs`** — *legacy.* ADS read/write via `windows-rs`, now only read by `llmctx migrate`. Non-Windows stub returns `AdsError::NotSupported` gracefully
 - **`config.rs`** — `llmcontext.yaml` parsing with per-file walk-up resolution (mirrors `.gitignore` semantics). `find_config()`, `load_config()`, `load_config_for_file()`. `ProjectConfig` struct with `header_block()` builder
 - **`extract.rs`** — `<<<LLMCTX … LLMCTX>>>` comment-block detection and stripping. Handles all comment prefix styles (`#`, `//`, `/* */`, `<!-- -->`). Validates all six required fields. Malformed blocks fall through to Ollama — never a silent failure. `extract_llmctx_block()` → `Result<ExtractedContext, ExtractError>`
 - **`ollama.rs`** — `OllamaClient` wrapping `reqwest`. `generate()` builds the six-field prompt and parses the response. Shared `reqwest::Client` for connection pooling
-- **`process.rs`** — **the keystone**. `process_file(path, client, force_ollama)`: extraction-first → Ollama fallback. Injects project header and version stamp either way. `content_hash()` for daemon debounce. `ProcessSource` enum (`Extracted | Ollama | SkippedTooSmall | SkippedUnreadable`). Both daemon and CLI call this — never reimplement the branch
+- **`process.rs`** — **the keystone**. `process_file(path, client, opts)`: project/store lookup → resume gate (current or carried-over context) → extraction-first → Ollama fallback. Stores context *before* stripping a block from source. `stored_context()` backs `llmctx pack`. `ProcessSource` enum (`Extracted | Ollama | UpToDate | Reused | SkippedTooSmall | SkippedTooLarge | SkippedUnreadable | SkippedNoProject`). Both daemon and CLI call this — never reimplement the branch
 
 ### crates/daemon ✅
 - **`main.rs`** — TCP listener with port fallback (tries 51515–51524, warns if non-default port used). NDJSON framing. Inbound: `{"type":"save"}`. Outbound: `{"type":"status"}` and `{"type":"updateAvailable"}`. Client registry (`Vec<ClientTx>`) so the update-check task can broadcast to all connected VS Code windows. Extraction fast-path (immediate, no semaphore). Ollama branch (30s debounce + bounded `Semaphore`). Real update-check via `reqwest` GET to GitHub Releases API: parses `tag_name`, compares semver, broadcasts `UpdateAvailable` to all clients. `is_newer()` + `parse_semver()` with unit tests
 
 ### crates/cli ✅
-- **`main.rs`** — five clap subcommands: `init` (non-interactive template), `index` (`.gitignore` + `llmctx_ignore` via `ignore` crate; streaming walker via `async-channel` bounded channel with `concurrency` consumer tasks — never holds all file paths in memory, safe on 100k+ file repos), `pack` (ADS + source → clipboard via `arboard`), `reindex` (force Ollama, `force_ollama=true`), `extract` (calls `process_file`)
+- **`main.rs`** — seven clap subcommands: `init` (non-interactive template), `index` (`.gitignore` + `llmctx_ignore` via `ignore` crate, never descends into `.llmctx/`; streaming walker via `async-channel` bounded channel with `concurrency` consumer tasks — never holds all file paths in memory, safe on 100k+ file repos), `pack` (stored context + source → clipboard via `arboard`), `reindex` (clear stored context, force Ollama), `extract` (calls `process_file`), `migrate` (v0.1 ADS → store), `gc` (prune rows for missing files)
 
 ### crates/cpctx ✅ (new)
 - **`main.rs`** — two clap subcommands:
-  - `cpctx copy <src> <dest>` — copies file or directory tree, then reads ADS from each source and writes it to the corresponding destination. Gracefully handles: no ADS on source (normal), `AdsError::NotSupported` (non-Windows), write failures (warns but doesn't abort the copy)
+  - `cpctx copy <src> <dest>` — copies file or directory tree, then carries each file's stored context into the destination project's store (see "cpctx" below). Gracefully handles: no context on source (normal), destination outside any project (a copied folder gets its own store), write failures (warns but doesn't abort the copy)
   - `cpctx setup` — on Windows: writes binary dir to `HKCU\Environment\Path` registry key (permanent, no admin), patches PowerShell profile with a guarded `$env:PATH` prepend, idempotent. On non-Windows: prints manual `export PATH=` instructions
 
 ### vscode-extension ✅
@@ -165,8 +171,8 @@ The `zeroize` pin and `clap` pin in `Cargo.toml` can be removed once the workspa
 |---|---|
 | Replace `your-org/llmctx` placeholder | Two places: `RELEASES_URL` in `crates/daemon/src/main.rs` and the two `openExternal` calls in `vscode-extension/src/pack.ts` and `extension.ts`. Set to the real GitHub repo URL before publishing |
 | Replace `"publisher": "llmctx"` | `vscode-extension/package.json` — update to the real VS Code Marketplace publisher ID before Marketplace submission |
-| Windows ADS integration test | Still needs a live test on the real Windows machine: save a file with a `<<<LLMCTX` block, verify the block is stripped and `llmctx pack` includes the context. The code now compiles cleanly (see Bugs Found & Fixed), but read/write against a real NTFS stream hasn't been exercised yet |
-| `cpctx copy` integration test | Copy a file with existing ADS, verify `llmctx pack` on the destination produces the same context |
+| Windows live test of the store | Verified end-to-end on Linux (index, resume, pack, rename carry-over, gc, cpctx, 3 concurrent writers) and cross-compiled for `x86_64-pc-windows-gnu`, but not yet run on a real Windows machine. Check: `.llmctx` gets the hidden attribute, and paths typed with different drive-letter case map to one key |
+| `llmctx migrate` live test | Needs a Windows machine with v0.1 streams: run `llmctx migrate`, confirm `llmctx pack` shows the old context, then `--remove-streams` |
 | End-to-end daemon test | Start `llmctxd`, open VS Code, save a file, watch status bar cycle queued → generating → ready |
 | ~~VS Code extension packaging~~ | ✅ Done — `npm install && npm run package` verified producing a working `.vsix` after the `vscode:prepublish` fix |
 | Minor cosmetic warning | `DebounceEntry.last_save` field in `crates/daemon/src/main.rs` triggers a harmless `dead_code` warning (never read, only written). Not blocking, cheap to silence with `#[allow(dead_code)]` or by actually using it for debounce-window logic later |
@@ -191,7 +197,8 @@ llmctx/
     ├── core/                   ← shared library (llmctx-core)
     │   └── src/
     │       ├── lib.rs
-    │       ├── ads.rs          ← NTFS ADS, windows-rs, version stamp
+    │       ├── store.rs        ← .llmctx/context.db (SQLite) — the context store
+    │       ├── ads.rs          ← legacy NTFS ADS reader, used by `llmctx migrate`
     │       ├── config.rs       ← llmcontext.yaml, walk-up resolution
     │       ├── extract.rs      ← <<<LLMCTX block detection + stripping
     │       ├── ollama.rs       ← Ollama /api/generate client
@@ -221,7 +228,8 @@ vscode-extension/
 | Async runtime | `tokio` |
 | HTTP — Ollama calls | `reqwest` |
 | CLI argument parsing | `clap` (pinned `=4.4.18` for Rust <1.85 compat) |
-| Windows ADS / API | `windows` (windows-rs, target_os = "windows" guard) |
+| Context store | `rusqlite` with `bundled` (SQLite compiled in, no system dependency) |
+| Windows API (legacy ADS, hidden attribute) | `windows` (windows-rs, target_os = "windows" guard) |
 | Clipboard | `arboard` |
 | YAML parsing | `serde` + `serde_yaml` |
 | JSON — daemon protocol + Ollama response | `serde_json` |
@@ -251,14 +259,16 @@ Pack does NOT go over the socket — handled entirely in the extension by shelli
 
 ---
 
-## ADS Content Format
+## Stored Context Format
+
+One row per file in the `context` table (`rel_path` PK, `content_hash`, `body`, `version`, `updated_at`; index on `content_hash`). The `body` is what `llmctx pack` prints:
 
 ```
-LLMCTX_VERSION: 1
 PROJECT: My Project Name | Python, FastAPI, PostgreSQL
 TASK: Current task description
 CONVENTIONS: All DB models in /models | Routes return {data, error}
 SOURCE: llm | ollama
+HASH: <sha256 of the source this was generated from>
 
 FILE: auth/middleware.py
 ROLE: Middleware for JWT verification on protected routes
@@ -270,11 +280,11 @@ NOTES: Any unusual patterns or gotchas
 
 ---
 
-## cpctx — Context-Preserving Copy (new tool)
+## cpctx — Context-Preserving Copy
 
-**Problem solved:** Windows Explorer, `cp`, `robocopy` (without `/COPYALL`), most ZIP tools, and most cloud sync clients silently discard NTFS ADS when copying files. All the context built up by `llmctxd` is lost.
+**Problem solved:** copying files from one project into another would leave their context behind in the source project's store. (Copying a whole project folder needs nothing, since the store is inside it.)
 
-**Solution:** `cpctx copy <src> <dest>` copies file content then immediately calls `ads::read_ads(src)` + `ads::write_ads(dest, body)` for each file. Works on single files and directory trees.
+**Solution:** `cpctx copy <src> <dest>` copies all file content first, then for each file reads its row from the source project's store and writes it into the destination project's store, with `FILE:` rewritten to the new path. Copying bytes first matters: a copied `llmcontext.yaml` must be in place before destination roots are resolved. `.llmctx/` directories are skipped during the byte copy, and a copied folder that lands outside every project gets its own store.
 
 **PATH registration:** `cpctx setup` (run once, no admin required):
 1. Reads `HKCU\Environment\Path` via `reg query`
@@ -282,7 +292,18 @@ NOTES: Any unusual patterns or gotchas
 3. Detects the PowerShell profile path via `$PROFILE`, appends a guarded `$env:PATH` block
 4. Both steps are idempotent — running setup twice is safe
 
-**Fallback on non-NTFS / non-Windows:** file content is copied normally; ADS steps return `AdsError::NotSupported` and are silently skipped.
+**Failures carrying context are warnings, not errors:** the bytes are already copied, and `llmctx index` can regenerate anything missing.
+
+---
+
+## Storage redesign (v0.1 → store)
+
+- **Why:** ADS exists only on NTFS, and Explorer copies, `cp`, ZIP, cloud sync, WSL, FAT/exFAT and most network shares drop it. llmctx needed storage it owns, independent of the user's file system. This follows the same principle as HDFS: a storage format and index kept in ordinary files on the native file system, not a kernel-level file system.
+- **What:** `crates/core/src/store.rs`, one SQLite DB per project in a self-ignoring `.llmctx/`. Rollback journal rather than WAL, because WAL's shared memory breaks on network file systems. `busy_timeout` of 5 s lets the daemon and CLI write concurrently.
+- **Renames:** lookups fall back from path to content hash; `Adopted` context is re-keyed and its `FILE:` field retargeted.
+- **New CLI:** `llmctx gc` (prune rows for missing files), `llmctx migrate` (import v0.1 streams).
+- **Daemon:** ignores saves outside any project before queueing.
+- **Extension:** `configurationDefaults` hide `**/.llmctx` from the Explorer and the file watcher.
 
 ---
 
@@ -292,14 +313,15 @@ Build verified on a real Windows machine; three real bugs found and fixed along 
 (see "Bugs Found & Fixed"). VS Code extension packaging is also verified working. To
 continue:
 
-1. **Exercise the actual ADS read/write path** on the real machine — the code compiles
-   now, but a live save-a-file-with-a-`<<<LLMCTX>>>`-block test hasn't been run yet:
+1. **Exercise the store on the real Windows machine**. It is verified on Linux and
+   cross-compiles for Windows, but hasn't run there yet:
    ```powershell
    cargo build --release -p llmctxd -p llmctx -p cpctx
    cpctx setup
    llmctxd    # in one terminal
    # then, in the project you're testing: save a file with a <<<LLMCTX block, confirm
-   # it gets stripped from the source and `llmctx pack` includes the context
+   # it gets stripped from the source, .llmctx\ appears (hidden), and `llmctx pack`
+   # includes the context. Then run `llmctx migrate` on a project with v0.1 streams.
    ```
 
 2. **Fill two string placeholders** (search for `your-org/llmctx`):
@@ -308,7 +330,7 @@ continue:
    - `vscode-extension/src/extension.ts` → one `openExternal` URL
    - `vscode-extension/package.json` → `"publisher"` field
 
-3. **Run the remaining integration tests** — `cpctx copy` round-trip, end-to-end daemon
-   status-bar cycle (see "What Remains").
+3. **Run the remaining integration tests**: the end-to-end daemon status-bar cycle
+   (see "What Remains").
 
 4. **Commission code signing** before public release.

@@ -102,7 +102,7 @@ export class StatusBarManager implements vscode.Disposable {
 
     if (!fileState) {
       // File hasn't been seen by the daemon yet (e.g. never saved this session,
-      // or ADS already exists from a previous session so no notification was sent).
+      // or context already exists from a previous session so no notification was sent).
       this.item.text = "$(database) llmctx";
       this.item.tooltip =
         "llmctx: save this file to update its context, or click to pack";

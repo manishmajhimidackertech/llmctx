@@ -2,9 +2,9 @@
 // FILE: crates/daemon/src/main.rs
 // ROLE: Background daemon — listens for VS Code save events, runs extraction immediately, debounces Ollama
 // EXPORTS: NONE (binary)
-// IMPORTS: crates/core/src/process.rs, crates/core/src/ads.rs, crates/core/src/config.rs
+// IMPORTS: crates/core/src/process.rs, crates/core/src/store.rs
 // USED BY: UNKNOWN
-// NOTES: One process per machine; bounded Ollama worker pool (default 2); extraction never debounced
+// NOTES: One process per machine; bounded Ollama worker pool (default 2); extraction never debounced; saves outside any project are ignored
 // LLMCTX>>>
 
 use std::{
@@ -23,11 +23,12 @@ use tokio::{
     sync::{mpsc, Mutex, Semaphore},
     time::sleep,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use llmctx_core::{
     ollama::OllamaClient,
     process::{self, ProcessOptions, ProcessSource},
+    store,
 };
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -257,6 +258,14 @@ async fn handle_save(
     ollama_sem: Arc<Semaphore>,
     debounce: DebounceMap,
 ) {
+    // A save outside every project (a settings file, a scratch file) has
+    // nowhere to store context. Ignore it before it is queued or debounced,
+    // so the status bar never shows work that will not happen.
+    if store::project_root_for_file(&path).is_none() {
+        debug!(?path, "not inside an llmctx project — ignoring save");
+        return;
+    }
+
     {
         let mut map = debounce.lock().await;
         map.insert(
@@ -290,8 +299,10 @@ async fn handle_save(
         };
         match process::process_file(&path, &client, ProcessOptions::new()).await {
             Ok(r)
-                if r.source == ProcessSource::Extracted
-                    || r.source == ProcessSource::UpToDate =>
+                if matches!(
+                    r.source,
+                    ProcessSource::Extracted | ProcessSource::UpToDate | ProcessSource::Reused
+                ) =>
             {
                 send(StatusState::Ready, None)
             }

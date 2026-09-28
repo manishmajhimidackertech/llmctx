@@ -6,7 +6,7 @@ conventions:
   - "No unwrap() in library code — use thiserror + anyhow at boundaries"
   - "Every public async fn returns a typed Result; never panics"
   - "process_file() is the single authoritative decision fn — daemon and CLI never reimplement its branch logic"
-  - "ADS version stamp is prepended by write_ads(), never by callers"
+  - "Context is only written through store.rs (ContextStore::put); nothing else touches .llmctx/"
   - "LLMCTX comment blocks are invisible infrastructure — do not narrate them to users"
 
 llmctx_ignore:

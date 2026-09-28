@@ -1,10 +1,10 @@
 // <<<LLMCTX
 // FILE: crates/cli/src/main.rs
-// ROLE: CLI binary — init, index, pack, reindex, extract commands via clap
+// ROLE: CLI binary — init, index, pack, reindex, extract, migrate, gc commands via clap
 // EXPORTS: NONE (binary)
-// IMPORTS: crates/core/src/process.rs, crates/core/src/ads.rs, crates/core/src/config.rs
+// IMPORTS: crates/core/src/process.rs, crates/core/src/store.rs, crates/core/src/ads.rs, crates/core/src/config.rs
 // USED BY: UNKNOWN
-// NOTES: index respects .gitignore + llmctx_ignore; init is non-interactive; pack reads ADS directly
+// NOTES: index respects .gitignore + llmctx_ignore and never descends into .llmctx/; init is non-interactive; ads is only read by migrate
 // LLMCTX>>>
 
 use std::{
@@ -24,6 +24,7 @@ use llmctx_core::{
     config::{self, ProjectConfig, CONFIG_FILENAME},
     ollama::OllamaClient,
     process::{self, ProcessError, ProcessOptions, ProcessSource},
+    store::{self, ContextStore, StoreSet, STORE_DIR},
 };
 
 // ── CLI definition ────────────────────────────────────────────────────────────
@@ -59,7 +60,7 @@ enum Command {
         force: bool,
     },
 
-    /// Merge ADS context + source and copy to clipboard (same as clicking the status bar button).
+    /// Merge stored context + source and copy to clipboard (same as clicking the status bar button).
     Pack {
         /// Source file to pack.
         file: PathBuf,
@@ -79,6 +80,25 @@ enum Command {
         /// Process even if stored context is already current for this content.
         #[arg(long)]
         force: bool,
+    },
+
+    /// Copy context from NTFS Alternate Data Streams (llmctx 0.1) into the
+    /// project's .llmctx store. Windows only; safe to run more than once.
+    Migrate {
+        /// Directory to migrate (default: current working directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+
+        /// Delete each stream once its context is safely in the store.
+        #[arg(long)]
+        remove_streams: bool,
+    },
+
+    /// Remove stored context for files that no longer exist.
+    Gc {
+        /// Any directory inside the project (default: current working directory).
+        #[arg(default_value = ".")]
+        dir: PathBuf,
     },
 }
 
@@ -105,6 +125,8 @@ async fn main() -> Result<()> {
         Command::Extract { file, force } => {
             cmd_extract(&file, Arc::clone(&client), force).await?
         }
+        Command::Migrate { dir, remove_streams } => cmd_migrate(&dir, remove_streams)?,
+        Command::Gc { dir } => cmd_gc(&dir)?,
     }
 
     Ok(())
@@ -163,20 +185,47 @@ llmctx_ignore:
 
 // ── index ─────────────────────────────────────────────────────────────────────
 
-async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result<()> {
-    // Load config to get llmctx_ignore and concurrency setting.
-    let (config_path, config) = match config::find_config(dir)
-        .and_then(|p| config::load_config(&p).map(|c| (p, c)))
-    {
+/// Config governing `dir`, or defaults (with a warning) if there is none.
+fn load_dir_config(dir: &Path) -> (PathBuf, ProjectConfig) {
+    match config::find_config(dir).and_then(|p| config::load_config(&p).map(|c| (p, c))) {
         Ok(pair) => pair,
         Err(e) => {
             warn!("no config found in {}: {e} — using defaults", dir.display());
             (dir.join(CONFIG_FILENAME), ProjectConfig::default())
         }
-    };
+    }
+}
 
+/// Walker over the project files under `dir`: honours .gitignore and the
+/// config's `llmctx_ignore`, and never descends into the context store.
+fn project_walker(dir: &Path, config_path: &Path, config: &ProjectConfig) -> Result<WalkBuilder> {
+    let mut walker = WalkBuilder::new(dir);
+    walker.standard_filters(true); // honours .gitignore, .git/, hidden files
+
+    // Add llmctx_ignore patterns as overrides.
+    // `ignore` crate supports adding override globs directly.
+    let mut overrides = ignore::overrides::OverrideBuilder::new(
+        config_path.parent().unwrap_or(dir),
+    );
+    for pattern in &config.llmctx_ignore {
+        // Prefix with `!` to turn them into ignore patterns (OverrideBuilder
+        // treats un-prefixed patterns as whitelist; `!` means exclude).
+        overrides
+            .add(&format!("!{pattern}"))
+            .with_context(|| format!("invalid llmctx_ignore pattern: {pattern}"))?;
+    }
+    walker.overrides(overrides.build()?);
+
+    // Hidden-file filtering already skips `.llmctx/` on most platforms, but
+    // Windows decides "hidden" by attribute — so exclude it explicitly.
+    walker.filter_entry(|e| e.file_name() != STORE_DIR);
+    Ok(walker)
+}
+
+async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result<()> {
+    // Load config to get llmctx_ignore and concurrency setting.
+    let (config_path, config) = load_dir_config(dir);
     let concurrency = config.ollama_concurrency_or_default();
-    let ignore_patterns = config.llmctx_ignore.clone();
 
     // ── Pre-flight ────────────────────────────────────────────────────────────
     // Probe Ollama once before doing any work. Without this, a stopped server
@@ -222,24 +271,7 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
         if force { ", --force" } else { "" }
     );
 
-    // Build a walker that respects .gitignore by default, plus our own patterns.
-    let mut walker = WalkBuilder::new(dir);
-    walker.standard_filters(true); // honours .gitignore, .git/, hidden files
-
-    // Add llmctx_ignore patterns as overrides.
-    // `ignore` crate supports adding override globs directly.
-    let mut overrides = ignore::overrides::OverrideBuilder::new(
-        config_path.parent().unwrap_or(dir),
-    );
-    for pattern in &ignore_patterns {
-        // Prefix with `!` to turn them into ignore patterns (OverrideBuilder
-        // treats un-prefixed patterns as whitelist; `!` means exclude).
-        overrides
-            .add(&format!("!{pattern}"))
-            .with_context(|| format!("invalid llmctx_ignore pattern: {pattern}"))?;
-    }
-    let overrides = overrides.build()?;
-    walker.overrides(overrides);
+    let walker = project_walker(dir, &config_path, &config)?;
 
     // Stream files through a bounded channel so we never hold all paths in
     // memory at once.  This is important for large repos (100k+ files): the
@@ -305,9 +337,14 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
                             info!("{}: already current — skipped", path.display());
                             Outcome::UpToDate
                         }
+                        ProcessSource::Reused => {
+                            info!("{}: carried over from identical file", path.display());
+                            Outcome::Reused
+                        }
                         ProcessSource::SkippedTooLarge => Outcome::TooLarge,
                         ProcessSource::SkippedTooSmall
-                        | ProcessSource::SkippedUnreadable => Outcome::Skipped,
+                        | ProcessSource::SkippedUnreadable
+                        | ProcessSource::SkippedNoProject => Outcome::Skipped,
                     },
                     Err(e) => {
                         error!("{}: {e}", path.display());
@@ -331,6 +368,7 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
     // Tally results (each was already logged by the worker that produced it).
     let mut ok = 0usize;
     let mut up_to_date = 0usize;
+    let mut reused = 0usize;
     let mut skipped = 0usize;
     let mut too_large = 0usize;
     let mut errors = 0usize;
@@ -340,6 +378,7 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
         match outcome {
             Outcome::Processed => ok += 1,
             Outcome::UpToDate => up_to_date += 1,
+            Outcome::Reused => reused += 1,
             Outcome::Skipped => skipped += 1,
             Outcome::TooLarge => too_large += 1,
             Outcome::Error(was_timeout) => {
@@ -352,8 +391,8 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
     }
 
     println!(
-        "index complete: {ok} processed, {up_to_date} already current, {skipped} skipped, \
-         {too_large} too large, {errors} errors"
+        "index complete: {ok} processed, {up_to_date} already current, {reused} carried over, \
+         {skipped} skipped, {too_large} too large, {errors} errors"
     );
 
     if too_large > 0 {
@@ -381,6 +420,7 @@ async fn cmd_index(dir: &Path, client: Arc<OllamaClient>, force: bool) -> Result
 enum Outcome {
     Processed,
     UpToDate,
+    Reused,
     Skipped,
     TooLarge,
     Error(bool),
@@ -398,21 +438,23 @@ fn cmd_pack(file: &Path) -> Result<()> {
     let source = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
 
-    let context_body = match ads::read_ads(file) {
-        Ok(body) => body,
-        Err(ads::AdsError::NotSupported) => {
-            eprintln!("warning: ADS is only supported on Windows — context will be empty");
-            String::new()
-        }
-        Err(ads::AdsError::Empty) | Err(ads::AdsError::VersionMismatch { .. }) => {
+    let context_body = match process::stored_context(file) {
+        Ok(Some(body)) => body,
+        Ok(None) => {
             eprintln!(
                 "warning: no context yet for {} — daemon may still be generating",
                 file.display()
             );
+            if matches!(ads::ads_exists(file), Ok(true)) {
+                eprintln!(
+                    "hint: this file has context from an older llmctx in an NTFS stream — \
+                     run `llmctx migrate` in the project root to bring it over"
+                );
+            }
             "[no context yet — daemon may still be generating, try again shortly]".into()
         }
         Err(e) => {
-            eprintln!("warning: could not read ADS: {e}");
+            eprintln!("warning: could not read stored context: {e}");
             String::new()
         }
     };
@@ -443,14 +485,15 @@ fn cmd_pack(file: &Path) -> Result<()> {
 // ── reindex ───────────────────────────────────────────────────────────────────
 
 async fn cmd_reindex(file: &Path, client: Arc<OllamaClient>) -> Result<()> {
-    // Clear existing ADS first so stale data can't bleed through.
-    match ads::clear_ads(file) {
-        Ok(()) => {}
-        Err(ads::AdsError::NotSupported) => {
-            eprintln!("ADS is only supported on Windows.");
-            return Ok(());
+    // Clear existing context first so stale data can't bleed through.
+    match ContextStore::open_existing_for_file(file) {
+        Ok(Some((store, rel))) => {
+            if let Err(e) = store.remove(&rel) {
+                warn!("could not clear stored context before reindex: {e}");
+            }
         }
-        Err(e) => warn!("could not clear ADS before reindex: {e}"),
+        Ok(None) => {}
+        Err(e) => warn!("could not open context store before reindex: {e}"),
     }
 
     let result = process::process_file(file, &client, ProcessOptions::force_ollama())
@@ -465,7 +508,11 @@ async fn cmd_reindex(file: &Path, client: Arc<OllamaClient>) -> Result<()> {
             file.display()
         ),
         ProcessSource::SkippedUnreadable => println!("skipped {} (unreadable)", file.display()),
-        ProcessSource::UpToDate => {
+        ProcessSource::SkippedNoProject => println!(
+            "skipped {} (not inside an llmctx project — run `llmctx init` in the project root)",
+            file.display()
+        ),
+        ProcessSource::UpToDate | ProcessSource::Reused => {
             // force_ollama() sets force = true, so the resume gate is bypassed.
             println!("{} was already current (unexpected with --force)", file.display());
         }
@@ -497,6 +544,14 @@ async fn cmd_extract(file: &Path, client: Arc<OllamaClient>, force: bool) -> Res
             "{} already has current context — nothing to do (use --force to regenerate)",
             file.display()
         ),
+        ProcessSource::Reused => println!(
+            "carried over context from an identical file to {}",
+            file.display()
+        ),
+        ProcessSource::SkippedNoProject => println!(
+            "skipped {} (not inside an llmctx project — run `llmctx init` in the project root)",
+            file.display()
+        ),
         ProcessSource::SkippedTooSmall => println!("skipped {} (too small)", file.display()),
         ProcessSource::SkippedTooLarge => println!(
             "skipped {} (larger than ollama_max_bytes)",
@@ -505,5 +560,125 @@ async fn cmd_extract(file: &Path, client: Arc<OllamaClient>, force: bool) -> Res
         ProcessSource::SkippedUnreadable => println!("skipped {} (binary/unreadable)", file.display()),
     }
 
+    Ok(())
+}
+
+// ── migrate ───────────────────────────────────────────────────────────────────
+
+/// Copy every NTFS-stream context under `dir` into its project's store.
+///
+/// Idempotent: a file that already has context in the store keeps it (it is
+/// at least as new as the stream). Streams are only deleted on request, and
+/// only after their context is in the store.
+fn cmd_migrate(dir: &Path, remove_streams: bool) -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        println!("nothing to migrate: NTFS streams only exist on Windows");
+        return Ok(());
+    }
+
+    let (config_path, config) = load_dir_config(dir);
+    let walker = project_walker(dir, &config_path, &config)?;
+    let mut stores = StoreSet::new();
+
+    let (mut imported, mut already, mut removed, mut failed) = (0usize, 0usize, 0usize, 0usize);
+
+    for entry in walker.build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if !matches!(ads::ads_exists(path), Ok(true)) {
+            continue;
+        }
+        let body = match ads::read_ads(path) {
+            Ok(body) => body,
+            // An empty or pre-versioning stream has nothing worth keeping.
+            Err(ads::AdsError::Empty) | Err(ads::AdsError::VersionMismatch { .. }) => continue,
+            Err(e) => {
+                warn!("{}: could not read stream: {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+
+        let (store, rel) = match stores.for_file(path) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("{}: {e}", path.display());
+                failed += 1;
+                continue;
+            }
+        };
+        let stored = match store.get(&rel) {
+            Ok(Some(_)) => {
+                already += 1;
+                true
+            }
+            // Bodies from before the HASH field get an empty hash, so they
+            // are served by `pack` but regenerated by the next index.
+            Ok(None) => {
+                let hash = process::stored_hash(&body).unwrap_or_default();
+                match store.put(&rel, &hash, &body) {
+                    Ok(()) => {
+                        info!("{}: migrated", path.display());
+                        imported += 1;
+                        true
+                    }
+                    Err(e) => {
+                        warn!("{}: {e}", path.display());
+                        failed += 1;
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("{}: {e}", path.display());
+                failed += 1;
+                false
+            }
+        };
+
+        if remove_streams && stored {
+            match ads::clear_ads(path) {
+                Ok(()) => removed += 1,
+                Err(e) => warn!("{}: could not remove stream: {e}", path.display()),
+            }
+        }
+    }
+
+    println!(
+        "migrate complete: {imported} imported, {already} already in the store, {failed} failed{}",
+        if remove_streams {
+            format!(", {removed} streams removed")
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
+}
+
+// ── gc ────────────────────────────────────────────────────────────────────────
+
+fn cmd_gc(dir: &Path) -> Result<()> {
+    let root = store::project_root(dir).with_context(|| {
+        format!(
+            "{} is not inside an llmctx project (no {CONFIG_FILENAME}, {STORE_DIR}/ or .git above it)",
+            dir.display()
+        )
+    })?;
+    let Some(store) = ContextStore::open_existing(&root)? else {
+        println!("no context store under {} — nothing to do", root.display());
+        return Ok(());
+    };
+    let removed = store.prune_missing()?;
+    for rel in &removed {
+        info!("{rel}: file no longer exists — context removed");
+    }
+    println!(
+        "gc complete: removed {} entr{} from {}",
+        removed.len(),
+        if removed.len() == 1 { "y" } else { "ies" },
+        store.db_path().display()
+    );
     Ok(())
 }

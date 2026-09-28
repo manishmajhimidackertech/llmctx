@@ -1,6 +1,6 @@
 [package]
 name        = "llmctx-core"
-description = "Shared library: ADS I/O, Ollama client, config, extraction, process orchestration"
+description = "Shared library: context store, Ollama client, config, extraction, process orchestration"
 version.workspace     = true
 edition.workspace     = true
 authors.workspace     = true
@@ -18,6 +18,7 @@ tracing     = { workspace = true }
 thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 ignore      = { workspace = true }
+rusqlite    = { workspace = true }
 
 [dev-dependencies]
 # Used by the config/process unit tests. Previously missing, which made

@@ -2,18 +2,30 @@
 
 Context for your source files, invisible to your repo.
 
-llmctx attaches a per-file context block to every source file in your project using NTFS Alternate Data Streams — a hidden storage layer baked into Windows/NTFS that no editor, linter, formatter, or version-control tool ever sees. When you paste a file into an LLM, click the status bar button to merge the context in first.
+llmctx attaches a per-file context block to every source file in your project. The context lives in llmctx's own store, a single SQLite database in a hidden `.llmctx/` folder at the project root (much like `.git/`). Your source files are never touched, and the store works the same on any file system: NTFS, ext4, APFS, FAT32, exFAT or a network share. When you paste a file into an LLM, click the status bar button to merge the context in first.
 
 ---
 
 ## How it works
 
 1. **Save a file in VS Code.** The extension sends a save notification to the background daemon (`llmctxd`).
-2. **If the file contains an `<<<LLMCTX` comment block** (written by the LLM that last generated it), the daemon extracts it immediately, strips it from the source file, and writes it to the hidden stream. Ollama is never called.
-3. **Otherwise**, the daemon waits 30 seconds (in case you keep typing), then sends the file to a local Ollama model, which generates the six-field context block. The result is written to the hidden stream.
+2. **If the file contains an `<<<LLMCTX` comment block** (written by the LLM that last generated it), the daemon extracts it immediately, strips it from the source file, and writes it to the project's context store. Ollama is never called.
+3. **Otherwise**, the daemon waits 30 seconds (in case you keep typing), then sends the file to a local Ollama model, which generates the six-field context block. The result is written to the context store.
 4. **When you want to use the context**, click the status bar button (or run `llmctx: Pack current file to clipboard`). The context and source text are merged and placed on the clipboard. Paste into any LLM.
 
 The source files in your repo stay completely clean. No comments, no markers, nothing visible.
+
+---
+
+## Where context is stored
+
+Each project gets one store at `<project root>/.llmctx/context.db`. The project root is the folder holding `llmcontext.yaml`. Without one, llmctx uses the nearest folder that already has a `.llmctx/` store or is a git checkout. Files outside any project are ignored.
+
+- **Invisible to git.** `.llmctx/` contains its own `.gitignore` (`*`), so it never shows up in `git status`, and your own `.gitignore` is never edited. The VS Code extension hides the folder from the Explorer and file watcher. On Windows the folder also gets the hidden attribute.
+- **Travels with the project.** Copying, zipping, syncing or backing up the project folder with any tool keeps the context, because it is just a file inside the folder.
+- **Survives renames and moves.** Each entry is keyed by the file's path relative to the project root *and* by a hash of its content. When a renamed or moved file is next saved or indexed, llmctx finds its context by content and carries it over, with no Ollama call. A copied file gets its own copy of the context the same way.
+- **Safe to share between processes.** The daemon and the CLI can write at the same time. SQLite serialises the writes, and each one is all-or-nothing.
+- **Disposable.** Deleting `.llmctx/` loses nothing that `llmctx index` can't rebuild.
 
 ---
 
@@ -91,6 +103,8 @@ winget install Microsoft.VisualStudio.2022.BuildTools
 ```
 
 When the installer opens, tick **"Desktop development with C++"** and click Install. This is a one-time step.
+
+The same tools also compile SQLite, which is built into llmctx for its context store. On macOS and Linux the system C compiler is enough (`xcode-select --install` on macOS; `gcc` or `clang` on Linux).
 
 ### Step 5 — You are ready
 
@@ -185,7 +199,7 @@ section below.
 
 ### Prerequisites
 
-- Windows 10/11 on an NTFS volume (ADS is NTFS-only)
+- Windows, macOS or Linux, on any file system (the setup commands below use Windows PowerShell; adapt paths for other platforms)
 - Ollama installed, running, and with a model pulled (see "Installing Ollama" above if you haven't done this yet — it's easy to install Ollama and still miss the model-pull step)
 - Rust toolchain installed (see "Installing Rust" above if you need to install it)
 
@@ -271,11 +285,24 @@ This creates `llmcontext.yaml` at the project root. Edit it to describe your pro
 
 ---
 
+## Upgrading from llmctx 0.1 (NTFS streams)
+
+llmctx 0.1 kept context in NTFS Alternate Data Streams. To bring that context into the new store without regenerating it, run this once in each project root on Windows:
+
+```powershell
+llmctx migrate                   # copy stream context into .llmctx/context.db
+llmctx migrate --remove-streams  # ...and delete each stream once it is stored
+```
+
+`migrate` is safe to run more than once. It never overwrites context that is already in the store. If you skip it, `llmctx index` regenerates the context instead, which takes longer. Until you migrate, `llmctx pack` prints a hint when a file still has an old stream.
+
+---
+
 ## cpctx — Context-preserving copy
 
-Normal copy operations (Explorer drag-copy, `cp`, `robocopy` without the right flags) silently discard NTFS Alternate Data Streams. This means any context that `llmctxd` has built up for your files is lost when you copy a project to a new location, an external drive, or a network share.
+Copying a whole project folder keeps its context automatically, since the store lives inside the folder. `cpctx` is for the other case: copying files or folders **into a different project**. It copies the file content, then carries each file's context from the source project's store into the destination project's store, with the `FILE:` field updated to the new path.
 
-`cpctx` is a drop-in replacement for `cp` / `copy` that copies the file content **and** re-attaches the llmctx ADS stream on the destination.
+If a copied folder lands outside every project, it becomes a project of its own: cpctx creates a `.llmctx/` store at the top of the copy.
 
 ### Usage
 
@@ -307,10 +334,11 @@ After that you can use `cpctx copy` from any terminal or script on the machine w
 
 | Situation | What to do |
 |---|---|
-| Moving files to a new directory on the same NTFS volume | `cpctx copy` — streams are preserved |
-| Copying to an external drive, network share, or ZIP | `cpctx copy` then `llmctx index` on the destination (streams are preserved by cpctx but may be lost by the destination filesystem) |
-| Files copied by another tool (Explorer, robocopy, git clone) | `llmctx index` on the destination to regenerate from scratch |
-| Renaming a file in place | No action needed — rename keeps ADS |
+| Copying, zipping, syncing or backing up a whole project folder | Nothing: `.llmctx/` goes along with it |
+| Renaming or moving a file inside a project | Nothing: the next save or `llmctx index` carries its context over by content hash |
+| Copying files into a different project | `cpctx copy` |
+| A fresh `git clone` (the store is not committed) | `llmctx index` to generate context |
+| Files deleted or renamed outside VS Code piling up stale entries | `llmctx gc` |
 
 ---
 
@@ -351,8 +379,11 @@ llmctx pack <file>       Merge context + source → clipboard
 llmctx reindex <file>    Force Ollama regeneration for one file
 llmctx extract <file>    Run extraction/generation (same as daemon, once)
 llmctx extract --force   ...even if stored context is already current
+llmctx gc [dir]          Remove stored context for files that no longer exist
+llmctx migrate [dir]     Import context from llmctx 0.1 NTFS streams (Windows)
+llmctx migrate --remove-streams   ...and delete the streams afterwards
 
-cpctx copy <src> <dest>  Copy file or directory, preserving ADS context
+cpctx copy <src> <dest>  Copy file or directory, carrying context to the destination project
 cpctx setup              Register cpctx on the system PATH permanently
 ```
 
@@ -376,7 +407,7 @@ def verify_token():
     ...
 ```
 
-On the next save, the daemon detects the block, cuts it out of the source file, and writes it to the hidden stream. The file on disk ends up exactly as if the block was never there.
+On the next save, the daemon detects the block, cuts it out of the source file, and writes it to the context store. The file on disk ends up exactly as if the block was never there.
 
 See [`docs/llmctx.md`](docs/llmctx.md) (the skill file used by the LLM) for the full format specification and per-language examples.
 
@@ -402,7 +433,8 @@ llmctx/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs          # Re-exports all public modules
-│   │       ├── ads.rs          # NTFS ADS read/write (Windows only)
+│   │       ├── store.rs        # Context store: .llmctx/context.db (SQLite)
+│   │       ├── ads.rs          # Legacy NTFS stream reader, used by `llmctx migrate`
 │   │       ├── config.rs       # llmcontext.yaml parsing & walk-up resolution
 │   │       ├── extract.rs      # <<<LLMCTX block detection and stripping
 │   │       ├── ollama.rs       # Ollama /api/generate HTTP client
@@ -416,7 +448,7 @@ llmctx/
 │   ├── cli/                    # llmctx — CLI binary
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── main.rs         # init, index, pack, reindex, extract commands
+│   │       └── main.rs         # init, index, pack, reindex, extract, migrate, gc
 │   │
 │   └── cpctx/                  # cpctx — context-preserving copy binary
 │       ├── Cargo.toml
@@ -449,19 +481,20 @@ VS Code extension
   │
 llmctxd (daemon)
   │  extraction path (immediate, no semaphore)
-  │      detect <<<LLMCTX → extract → strip source → write ADS
+  │      detect <<<LLMCTX → extract → write store → strip source
   │  Ollama path (debounced 30 s, bounded pool)
-  │      hash check → acquire semaphore → call Ollama → write ADS
+  │      hash check → acquire semaphore → call Ollama → write store
   │
 llmctx-core (library)
-  ├── ads.rs        ADS read/write (Windows/NTFS only)
+  ├── store.rs      <project>/.llmctx/context.db — keyed by path and content hash
+  ├── ads.rs        legacy NTFS stream reader (llmctx migrate only)
   ├── config.rs     llmcontext.yaml — per-file walk-up resolution
   ├── extract.rs    <<<LLMCTX block detection and stripping
   ├── ollama.rs     Ollama /api/generate client
   └── process.rs    process_file() — the single decision function
 
 cpctx (standalone binary)
-      cpctx copy src dest   →  std::fs::copy + ads::read_ads + ads::write_ads
+      cpctx copy src dest   →  std::fs::copy, then source store → destination store
       cpctx setup           →  HKCU\Environment\Path + PowerShell profile
 ```
 
@@ -469,8 +502,8 @@ cpctx (standalone binary)
 
 ## Caveats
 
-- **Windows/NTFS only.** ADS does not exist on macOS, Linux, FAT32, exFAT, or network shares that strip streams. The CLI, daemon, and cpctx all compile and run on other platforms but ADS operations return a graceful error.
-- **Use cpctx instead of Explorer copy.** Drag-copying in Explorer or using `cp`/`robocopy` without explicit stream-preservation flags silently drops ADS. Use `cpctx copy` to preserve context. If files have already been copied by another tool, run `llmctx index` on the destination to regenerate.
-- **ZIP and cloud storage strip streams.** Uploading to OneDrive, Google Drive, Dropbox, or creating a ZIP archive discards ADS regardless of the copy method. After extracting or syncing, run `llmctx index` to regenerate context from scratch.
+- **Context is per machine unless you share the folder.** `.llmctx/` ignores itself in git, so a fresh clone starts without context. Run `llmctx index` after cloning.
+- **Files outside a project get no context.** The daemon ignores saves for files with no `llmcontext.yaml`, `.llmctx/` or `.git` above them, so it never scatters `.llmctx/` folders next to stray files. Run `llmctx init` to make a folder a project.
+- **Renames are matched by content.** A file renamed *and* edited before its next save no longer matches its old context by hash, so it is regenerated. The old entry lingers until `llmctx gc`.
 - **Ollama must be running, with a model pulled.** If Ollama isn't running, or is running but no model has been pulled, the file is marked `error` in the status bar. Check Task Manager for `ollama.exe`, and run `ollama list` to confirm a model is present — see "Installing Ollama" above. Save the file again once Ollama is up to retry.
 - **cpctx setup requires no admin rights.** It writes to `HKCU\Environment` (user-level, not system-level) and your PowerShell profile. No UAC prompt will appear.

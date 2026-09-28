@@ -189,17 +189,29 @@ llmctx reindex backend\pipeline\segmentation.py
 
 ## 7. Moving or backing up the project
 
-Alternate Data Streams don't survive every copy method. If you back up CodeA4 to another
-drive, use `cpctx` instead of Explorer drag-copy or plain `robocopy`:
+All of CodeA4's context lives in one file, `CodeA4\.llmctx\context.db`. Copying the
+project folder by any means keeps it: Explorer drag-copy, `robocopy`, a ZIP, an external
+or FAT32/exFAT drive, a network share, or a OneDrive/Drive/Dropbox sync. Nothing special
+is needed.
 
-```powershell
-cpctx copy C:\Users\Admin\Downloads\temp\CodeA4 D:\Backups\CodeA4
-```
+Renaming or moving a file *inside* the project is fine too. On its next save (or the next
+`llmctx index`), llmctx recognises the unchanged content and carries the context over
+without calling Ollama.
 
-If the project instead arrives somewhere via `git clone`, a ZIP extraction, or a cloud
-sync (OneDrive/Drive/Dropbox) — all of which strip ADS regardless — just run `llmctx index`
-again at the new location. It's cheap and safe to re-run; only files without valid,
-current context get sent to Ollama.
+Two cases do need a step:
+
+- **`git clone`**: `.llmctx\` ignores itself in git, so a fresh clone has no context. Run
+  `llmctx index` at the new location. It's cheap and safe to re-run; only files without
+  current context get sent to Ollama.
+- **Copying files into a *different* project**: use `cpctx`, which carries each file's
+  context into the destination project's store:
+
+  ```powershell
+  cpctx copy CodeA4\backend\pipeline D:\OtherProject\pipeline
+  ```
+
+If you used llmctx 0.1, which kept context in NTFS streams, run `llmctx migrate` once in
+the project root to move that context into the store instead of regenerating it.
 
 ---
 
@@ -221,9 +233,11 @@ current context get sent to Ollama.
   A small model's context window is only a few thousand tokens, so a bigger file gets
   truncated server-side and produces a useless answer after a long wait. Add such files to
   `llmctx_ignore`, or raise the limit if your model can handle it.
-- **Context missing entirely after a copy** — you're on a filesystem that doesn't support
-  ADS (FAT32, exFAT, a network share, WSL's Linux side), or the file was copied by
-  something other than `cpctx`. Run `llmctx index` at the destination.
+- **Context missing entirely after a copy** — the `.llmctx\` folder didn't come along.
+  Either the files were copied without the project root (use `cpctx copy` for that), or
+  the project came from `git clone`. Run `llmctx index` at the destination.
+- **Stale entries for deleted or renamed files** — run `llmctx gc` in the project to
+  remove context for files that no longer exist.
 - **A source fix seems to have had no effect** — you almost certainly did not
   rebuild, or rebuilt but left an older binary earlier on your PATH. Confirm with
   `where.exe llmctx`, and check that `llmctx index`'s first log line ends with
