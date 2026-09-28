@@ -26,6 +26,14 @@
         "title": "llmctx: Pack current file to clipboard"
       },
       {
+        "command": "llmctx.packWithImports",
+        "title": "llmctx: Pack current file with the context of its imports"
+      },
+      {
+        "command": "llmctx.copyProjectMap",
+        "title": "llmctx: Copy project map to clipboard"
+      },
+      {
         "command": "llmctx.reindex",
         "title": "llmctx: Reindex current file (force Ollama regeneration)"
       },
@@ -37,15 +45,22 @@
     "configuration": {
       "title": "llmctx",
       "properties": {
-        "llmctx.daemonPort": {
-          "type": "number",
-          "default": 51515,
-          "description": "TCP port the llmctxd daemon listens on."
+        "llmctx.autoStartDaemon": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the llmctxd daemon in the background when it is not already running."
+        },
+        "llmctx.daemonPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Absolute path to the llmctxd binary. Leave empty to use PATH resolution."
         },
         "llmctx.ollamaUrl": {
           "type": "string",
-          "default": "http://127.0.0.1:11434",
-          "description": "Ollama base URL (overrides llmcontext.yaml if set here)."
+          "default": "",
+          "scope": "machine",
+          "description": "Ollama base URL to use instead of llmcontext.yaml's. Needed for a remote Ollama: a repository's llmcontext.yaml may only point at this machine. Applies to CLI calls and to a daemon this extension starts (restart an already-running llmctxd to pick it up)."
         },
         "llmctx.statusBarAlignment": {
           "type": "string",
@@ -56,6 +71,7 @@
         "llmctx.cliPath": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "description": "Absolute path to the llmctx binary. Leave empty to use PATH resolution (recommended after running `cpctx setup`)."
         }
       }

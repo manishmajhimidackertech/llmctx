@@ -1,7 +1,7 @@
 // <<<LLMCTX
 // FILE: crates/core/src/config.rs
 // ROLE: Parse llmcontext.yaml and resolve it per-file by walking up the directory tree
-// EXPORTS: ProjectConfig, ConfigError, find_config(), load_config()
+// EXPORTS: ProjectConfig, ConfigError, find_config(), load_config(), load_config_for_file(), CONFIG_FILENAME
 // IMPORTS: NONE
 // USED BY: crates/core/src/process.rs, crates/cli/src/main.rs
 // NOTES: Resolution mirrors .gitignore semantics — nearest ancestor wins; no global state
@@ -60,6 +60,10 @@ pub struct ProjectConfig {
     pub llmctx_ignore: Vec<String>,
 
     /// Ollama base URL; defaults to http://127.0.0.1:11434 if absent.
+    ///
+    /// Because this file lives in the repository, only a URL on this machine
+    /// is honoured (see `ollama::resolve_ollama_url`). A remote server has to
+    /// be chosen by the user through `LLMCTX_OLLAMA_URL`.
     pub ollama_url: Option<String>,
 
     /// Ollama model to use; defaults to "phi3:mini" if absent.
@@ -83,15 +87,13 @@ pub struct ProjectConfig {
     /// truncated by the server anyway and produces a useless answer after a
     /// very long wait. Skipping is both faster and more honest.
     pub ollama_max_bytes: Option<usize>,
+
+    /// Context window (tokens) requested from Ollama. Defaults to a size
+    /// that fits a file of `ollama_max_bytes` plus the prompt.
+    pub ollama_num_ctx: Option<u32>,
 }
 
 impl ProjectConfig {
-    pub fn ollama_url_or_default(&self) -> &str {
-        self.ollama_url
-            .as_deref()
-            .unwrap_or("http://127.0.0.1:11434")
-    }
-
     pub fn ollama_model_or_default(&self) -> &str {
         self.ollama_model.as_deref().unwrap_or("phi3:mini")
     }
@@ -111,8 +113,21 @@ impl ProjectConfig {
         self.ollama_max_bytes.unwrap_or(16 * 1024)
     }
 
-    /// Formats the project header block that gets prepended to ADS content
-    /// after extraction or generation, so both producers write identical output.
+    /// Enough tokens for the largest file that will be sent (≈3 bytes per
+    /// token for source code) plus ~1k for the prompt and answer, rounded up
+    /// to a multiple of 1024 and never below 4096.
+    pub fn ollama_num_ctx_or_default(&self) -> u32 {
+        if let Some(n) = self.ollama_num_ctx {
+            return n.max(512);
+        }
+        let tokens = self.ollama_max_bytes_or_default() / 3 + 1024;
+        let rounded = tokens.div_ceil(1024) * 1024;
+        u32::try_from(rounded).unwrap_or(u32::MAX).max(4096)
+    }
+
+    /// Formats the project header shown above packed context. Rendered from
+    /// the current config every time, never stored, so edits take effect
+    /// immediately for every file.
     pub fn header_block(&self) -> String {
         let project = self.project.as_deref().unwrap_or("(unknown)");
         let stack = self.stack.as_deref().unwrap_or("");
@@ -240,11 +255,12 @@ ollama_concurrency: 4
     #[test]
     fn defaults_are_sensible() {
         let cfg = ProjectConfig::default();
-        assert_eq!(cfg.ollama_url_or_default(), "http://127.0.0.1:11434");
         assert_eq!(cfg.ollama_model_or_default(), "phi3:mini");
         assert_eq!(cfg.ollama_concurrency_or_default(), 1);
         assert_eq!(cfg.ollama_timeout_secs_or_default(), 300);
         assert_eq!(cfg.ollama_max_bytes_or_default(), 16 * 1024);
+        // 16 KB ≈ 5.5k tokens + prompt → 7k, more than Ollama's small default.
+        assert_eq!(cfg.ollama_num_ctx_or_default(), 7168);
     }
 
     #[test]

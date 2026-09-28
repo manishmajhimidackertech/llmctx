@@ -3,7 +3,7 @@
 // ROLE: Legacy reader/writer for the file:llmctx NTFS Alternate Data Stream, kept for `llmctx migrate`
 // EXPORTS: read_ads(), write_ads(), ads_exists(), clear_ads(), AdsError
 // IMPORTS: NONE
-// USED BY: crates/cli/src/main.rs
+// USED BY: crates/core/src/migrate.rs, crates/cli/src/main.rs
 // NOTES: Windows/NTFS only — every public function returns Err(AdsError::NotSupported) on non-Windows
 // LLMCTX>>>
 
@@ -270,10 +270,30 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    /// Version stamp round-trip is tested in process.rs integration tests
-    /// since they need a real temp file. Here we just verify the constant.
     #[test]
     fn version_constant_is_one() {
         assert_eq!(super::ADS_VERSION, 1);
+    }
+
+    /// Real NTFS streams: runs on the Windows CI runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stream_round_trip() {
+        use super::*;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        assert!(!ads_exists(&file).unwrap());
+        write_ads(&file, "FILE: a.txt\nROLE: r").unwrap();
+        assert!(ads_exists(&file).unwrap());
+        assert_eq!(read_ads(&file).unwrap(), "FILE: a.txt\nROLE: r");
+        // A shorter rewrite must not leave stale tail bytes behind.
+        write_ads(&file, "x").unwrap();
+        assert_eq!(read_ads(&file).unwrap(), "x");
+        clear_ads(&file).unwrap();
+        assert!(!ads_exists(&file).unwrap());
+        // The file's own content is untouched throughout.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "content");
     }
 }

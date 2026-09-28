@@ -19,6 +19,8 @@ thiserror   = { workspace = true }
 anyhow      = { workspace = true }
 ignore      = { workspace = true }
 rusqlite    = { workspace = true }
+url         = { workspace = true }
+getrandom   = { workspace = true }
 
 [dev-dependencies]
 # Used by the config/process unit tests. Previously missing, which made

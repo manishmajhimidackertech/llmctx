@@ -19,6 +19,7 @@ const ICON: Record<StatusState, string> = {
   queued: "$(clock)",
   generating: "$(sync~spin)",
   ready: "$(check)",
+  skipped: "$(circle-slash)",
   error: "$(warning)",
 };
 
@@ -26,6 +27,7 @@ const TOOLTIP: Record<StatusState, string> = {
   queued: "llmctx: queued for context generation",
   generating: "llmctx: generating context via Ollama…",
   ready: "llmctx: context ready — click to pack to clipboard",
+  skipped: "llmctx: no context is generated for this file",
   error: "llmctx: context generation failed — click to pack anyway",
 };
 
@@ -61,7 +63,8 @@ export class StatusBarManager implements vscode.Disposable {
     // Only show the disconnected badge if we've never connected this session.
     if (!this.daemonSeen) {
       this.item.text = "$(plug) llmctx";
-      this.item.tooltip = "llmctx: daemon not running — start llmctxd";
+      this.item.tooltip =
+        "llmctx: daemon not running — it starts automatically if `llmctx.autoStartDaemon` is on; otherwise run llmctxd";
       this.item.backgroundColor = new vscode.ThemeColor(
         "statusBarItem.warningBackground"
       );

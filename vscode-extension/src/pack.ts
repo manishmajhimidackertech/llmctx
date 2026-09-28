@@ -1,15 +1,14 @@
 // <<<LLMCTX
 // FILE: vscode-extension/src/pack.ts
-// ROLE: Read stored context via the CLI and merge it with source text for clipboard paste
-// EXPORTS: packFile(), reindexFile(), verifyCliOnPath()
+// ROLE: Shell out to the llmctx CLI for pack/map/reindex and put results on the clipboard via VS Code
+// EXPORTS: packFile(), copyProjectMap(), reindexFile(), verifyCliOnPath(), cliEnv()
 // IMPORTS: NONE
 // USED BY: vscode-extension/src/extension.ts
-// NOTES: Shells out to `llmctx pack` which reads the .llmctx store; detects missing binary with clear guidance
+// NOTES: The CLI prints (`--stdout`); the extension writes the clipboard, which works on every OS
 // LLMCTX>>>
 
 import * as vscode from "vscode";
 import * as fs from "fs";
-import * as path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 
@@ -67,7 +66,7 @@ export async function verifyCliOnPath(): Promise<void> {
         if (choice === "Open README") {
           void vscode.env.openExternal(
             vscode.Uri.parse(
-              "https://github.com/your-org/llmctx#installation"
+              "https://github.com/manishmajhimidackertech/llmctx#installation"
             )
           );
         }
@@ -77,30 +76,73 @@ export async function verifyCliOnPath(): Promise<void> {
 
 // ── pack ──────────────────────────────────────────────────────────────────────
 
+/** Large projects produce large packs; execFile's 1 MB default is too small. */
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
 /**
- * Pack the file at `filePath` to the system clipboard via `llmctx pack`.
- *
- * The CLI binary owns the context-store read logic so we shell out to it
- * rather than reimplementing SQLite access in TypeScript.
+ * Environment for CLI calls: the user's `llmctx.ollamaUrl`, if set, is passed
+ * as LLMCTX_OLLAMA_URL — the only way to point llmctx at a remote Ollama.
  */
-export async function packFile(filePath: string): Promise<void> {
+export function cliEnv(): NodeJS.ProcessEnv {
+  const url = vscode.workspace.getConfiguration("llmctx").get<string>("ollamaUrl", "").trim();
+  return url ? { ...process.env, LLMCTX_OLLAMA_URL: url } : process.env;
+}
+
+/**
+ * Pack the file at `filePath` (optionally with the context of the files it
+ * imports) and put the result on the clipboard.
+ *
+ * The CLI owns the store and the formatting; it prints the result and the
+ * extension copies it with VS Code's own clipboard API, which works the same
+ * on every platform (a CLI process that sets the clipboard and exits loses
+ * the contents on Linux).
+ */
+export async function packFile(filePath: string, withImports = false): Promise<void> {
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Window, title: "llmctx: packing…" },
     async () => {
       try {
         const bin = resolveCliBinary();
-        await execFileAsync(bin, ["pack", filePath], {
-          env: process.env,
+        const args = ["pack", filePath, "--stdout"];
+        if (withImports) {
+          args.push("--with-imports");
+        }
+        const { stdout } = await execFileAsync(bin, args, {
+          env: cliEnv(),
           timeout: 30_000,
+          maxBuffer: MAX_OUTPUT_BYTES,
         });
-        void vscode.window.showInformationMessage(
-          "llmctx: packed to clipboard — paste into any LLM"
-        );
+        await vscode.env.clipboard.writeText(stdout);
+        if (stdout.includes("[no context yet")) {
+          void vscode.window.showWarningMessage(
+            "llmctx: packed to clipboard, but this file has no context yet — save it, or run `llmctx index`"
+          );
+        } else {
+          void vscode.window.showInformationMessage(
+            "llmctx: packed to clipboard — paste into any LLM"
+          );
+        }
       } catch (err: unknown) {
         handleCliError(err, "pack");
       }
     }
   );
+}
+
+/** Copy the one-line-per-file project map for `folder` to the clipboard. */
+export async function copyProjectMap(folder: string): Promise<void> {
+  try {
+    const bin = resolveCliBinary();
+    const { stdout } = await execFileAsync(bin, ["map", folder], {
+      env: cliEnv(),
+      timeout: 30_000,
+      maxBuffer: MAX_OUTPUT_BYTES,
+    });
+    await vscode.env.clipboard.writeText(stdout);
+    void vscode.window.showInformationMessage("llmctx: project map copied to clipboard");
+  } catch (err: unknown) {
+    handleCliError(err, "map");
+  }
 }
 
 // ── reindex ───────────────────────────────────────────────────────────────────
@@ -114,11 +156,11 @@ export async function reindexFile(filePath: string): Promise<void> {
     async () => {
       try {
         const bin = resolveCliBinary();
-        await execFileAsync(bin, ["reindex", filePath], {
-          env: process.env,
-          timeout: 120_000,
+        const { stdout } = await execFileAsync(bin, ["reindex", filePath], {
+          env: cliEnv(),
+          timeout: 600_000,
         });
-        void vscode.window.showInformationMessage("llmctx: reindex complete");
+        void vscode.window.showInformationMessage(`llmctx: ${stdout.trim()}`);
       } catch (err: unknown) {
         handleCliError(err, "reindex");
       }
@@ -146,7 +188,7 @@ function handleCliError(err: unknown, command: string): void {
       .then((choice) => {
         if (choice === "Open README") {
           void vscode.env.openExternal(
-            vscode.Uri.parse("https://github.com/your-org/llmctx#installation")
+            vscode.Uri.parse("https://github.com/manishmajhimidackertech/llmctx#installation")
           );
         }
       });

@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
-use llmctx_core::store::{self, retarget_body, ContextStore, StoreSet, STORE_DIR};
+use llmctx_core::store::{self, set_field, ContextStore, StoreSet, STORE_DIR};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -209,8 +209,8 @@ fn carry_context(copied: &[(PathBuf, PathBuf)], verbose: bool) -> usize {
         };
 
         let written = stores.for_file(dst).and_then(|(store, rel)| {
-            let body = retarget_body(&context.body, &rel);
-            store.put(&rel, &context.content_hash, &body)
+            let fields = set_field(&context.fields, "FILE", &rel);
+            store.put(&rel, &context.content_hash, &context.source, &fields)
         });
         match written {
             Ok(()) => {
