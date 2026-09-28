@@ -1,10 +1,10 @@
 // <<<LLMCTX
 // FILE: vscode-extension/src/extension.ts
-// ROLE: VS Code extension entry point — wires save listener, daemon client, status bar, and commands
+// ROLE: VS Code extension entry point — wires save/rename/delete listeners, daemon client, status bar, and commands
 // EXPORTS: activate(), deactivate()
 // IMPORTS: vscode-extension/src/daemon.ts, vscode-extension/src/statusBar.ts, vscode-extension/src/pack.ts, vscode-extension/src/hash.ts
 // USED BY: VS Code extension host
-// NOTES: All disposables are registered on context.subscriptions; deactivate() is a no-op
+// NOTES: All disposables are registered on context.subscriptions; deactivate() is a no-op; the daemon is started on demand
 // LLMCTX>>>
 
 import * as vscode from "vscode";
@@ -13,14 +13,13 @@ import * as fs from "fs";
 
 import { DaemonClient, StatusMessage, UpdateAvailableMessage } from "./daemon";
 import { StatusBarManager } from "./statusBar";
-import { packFile, reindexFile, verifyCliOnPath } from "./pack";
+import { cliEnv, copyProjectMap, packFile, reindexFile, verifyCliOnPath } from "./pack";
 import { contentHash } from "./hash";
 
 // ── Extension lifecycle ───────────────────────────────────────────────────────
 
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("llmctx");
-  const port = config.get<number>("daemonPort", 51515);
   const barSide = config.get<string>("statusBarAlignment", "right");
 
   const alignment =
@@ -33,7 +32,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(statusBar);
 
   // ── Daemon client ─────────────────────────────────────────────────────────
-  const daemon = new DaemonClient(port);
+  // The daemon publishes its port and a token in a per-user file; the client
+  // finds it there, and starts llmctxd itself when none is running.
+  const ollamaUrl = cliEnv().LLMCTX_OLLAMA_URL;
+  const daemon = new DaemonClient({
+    autoStart: config.get<boolean>("autoStartDaemon", true),
+    daemonPath: config.get<string>("daemonPath", "").trim(),
+    env: ollamaUrl ? { LLMCTX_OLLAMA_URL: ollamaUrl } : {},
+  });
 
   daemon.on("connect", () => {
     statusBar.onDaemonConnect();
@@ -47,6 +53,15 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBar.setFileState(msg.path, msg.state, msg.message);
   });
 
+  daemon.on("startFailed", (err: Error) => {
+    const notFound = err.message.includes("ENOENT");
+    void vscode.window.showWarningMessage(
+      notFound
+        ? "llmctx: could not start the daemon — `llmctxd` is not on your PATH. Install it, or set `llmctx.daemonPath`."
+        : `llmctx: could not start the daemon: ${err.message}`
+    );
+  });
+
   daemon.on("updateAvailable", (msg: UpdateAvailableMessage) => {
     void vscode.window
       .showInformationMessage(
@@ -56,7 +71,7 @@ export function activate(context: vscode.ExtensionContext): void {
       .then((choice) => {
         if (choice === "Download") {
           void vscode.env.openExternal(
-            vscode.Uri.parse("https://github.com/your-org/llmctx/releases/latest")
+            vscode.Uri.parse("https://github.com/manishmajhimidackertech/llmctx/releases/latest")
           );
         }
       });
@@ -89,6 +104,29 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  // ── Rename / delete listeners ─────────────────────────────────────────────
+  //
+  // Only operations made through VS Code (Explorer, refactorings) are seen
+  // here. They keep stored context attached to the right paths, even when a
+  // renamed file is also edited; anything done outside VS Code is caught by
+  // content-hash matching and `llmctx index`/`gc` instead.
+  context.subscriptions.push(
+    vscode.workspace.onDidRenameFiles((e) => {
+      for (const { oldUri, newUri } of e.files) {
+        if (oldUri.scheme === "file" && newUri.scheme === "file") {
+          daemon.notifyRename(oldUri.fsPath, newUri.fsPath);
+        }
+      }
+    }),
+    vscode.workspace.onDidDeleteFiles((e) => {
+      for (const uri of e.files) {
+        if (uri.scheme === "file") {
+          daemon.notifyDelete(uri.fsPath);
+        }
+      }
+    })
+  );
+
   // ── Active editor listener (status bar refresh) ───────────────────────────
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -113,6 +151,34 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       await packFile(filePath);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("llmctx.packWithImports", async () => {
+      const filePath = activeFilePath();
+      if (!filePath) {
+        void vscode.window.showWarningMessage(
+          "llmctx: no active file to pack"
+        );
+        return;
+      }
+      await packFile(filePath, true);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("llmctx.copyProjectMap", async () => {
+      const folder =
+        (vscode.window.activeTextEditor &&
+          vscode.workspace.getWorkspaceFolder(vscode.window.activeTextEditor.document.uri)
+            ?.uri.fsPath) ??
+        vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!folder) {
+        void vscode.window.showWarningMessage("llmctx: open a folder first");
+        return;
+      }
+      await copyProjectMap(folder);
     })
   );
 

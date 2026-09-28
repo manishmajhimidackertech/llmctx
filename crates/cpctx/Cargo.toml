@@ -1,6 +1,6 @@
 [package]
 name        = "cpctx"
-description = "Context-preserving copy — copies files/directories and re-attaches llmctx ADS streams on the destination"
+description = "Context-preserving copy — copies files/directories and carries their llmctx context into the destination project"
 version.workspace     = true
 edition.workspace     = true
 authors.workspace     = true

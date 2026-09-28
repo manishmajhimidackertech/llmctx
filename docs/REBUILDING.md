@@ -23,10 +23,15 @@ confusing "Access is denied" or "The process cannot access the file" during the
 copy in step 4.
 
 ```powershell
-# Close VS Code (it starts llmctxd automatically), then confirm nothing is left:
+# The daemon the VS Code extension starts keeps running after VS Code closes,
+# so stop it explicitly:
 taskkill /IM llmctxd.exe /F 2>$null
 taskkill /IM llmctx.exe  /F 2>$null
 ```
+
+On Linux or macOS: `pkill llmctxd`. The next VS Code window starts the new build
+automatically. Its per-user discovery file (port and token) is rewritten on every
+start, so a stale one from the killed daemon does no harm.
 
 A non-zero exit here just means the process was not running. That is fine.
 
@@ -55,6 +60,10 @@ another platform does **not** guarantee a clean Windows build — and vice versa
 The `bail!` import in `crates/cpctx/src/main.rs` is exactly this: used only by
 the Windows PATH-setup code, so it reads as an unused import elsewhere.
 
+CI builds, lints and tests on Windows, macOS and Linux for every pull request
+(`.github/workflows/ci.yml`), which is the practical way to catch this before a
+user does.
+
 If a cross-platform build reports an unused import or dead code, check whether
 the only use site sits inside a `cfg` block for a different target before
 deleting anything. Silence it with a scoped attribute instead:
@@ -72,9 +81,10 @@ use anyhow::{bail, Context, Result};
 cargo test --workspace
 ```
 
-Expect **28 passed, 0 failed**. These are fast (well under a second) and catch
-config-parsing and extraction regressions before you spend forty minutes
-discovering them through Ollama.
+Expect **0 failed** (the exact count differs a little by platform: Windows also
+runs the NTFS-stream migration tests). They are fast (a second or two), need no
+Ollama, and catch config, extraction, store and ignore-rule regressions before
+you spend forty minutes discovering them through Ollama.
 
 ---
 
@@ -166,7 +176,7 @@ npm run compile
 ```powershell
 taskkill /IM llmctxd.exe /F 2>$null      # 1. stop
 cargo build --release                     # 2. build  (must say Finished)
-cargo test --workspace                    # 3. test   (28 passed)
+cargo test --workspace                    # 3. test   (0 failed)
 where.exe llmctx                          # 4. find the live binary, copy over it
 llmctx index --help                       # 5. verify (--force present)
 ```

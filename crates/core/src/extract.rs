@@ -4,7 +4,7 @@
 // EXPORTS: ExtractedContext, ExtractError, extract_llmctx_block()
 // IMPORTS: NONE
 // USED BY: crates/core/src/process.rs
-// NOTES: Never panics or guesses on malformed input — returns Err and leaves source untouched
+// NOTES: Only a block at the top of a file counts; never panics or guesses on malformed input; preserves CRLF line endings
 // LLMCTX>>>
 
 use thiserror::Error;
@@ -16,6 +16,10 @@ const CLOSE_DELIMITER: &str = "LLMCTX>>>";
 /// giving up looking for the closing delimiter.  Prevents an accidental
 /// `<<<LLMCTX` without a matching close from scanning an entire large file.
 const MAX_BLOCK_LINES: usize = 50;
+
+/// How many language-mandated lines (shebang, crate attribute, encoding
+/// cookie, …) may come before the opening delimiter.
+const MAX_PREAMBLE_LINES: usize = 5;
 
 /// The six required field names, in order.
 const REQUIRED_FIELDS: &[&str] = &[
@@ -48,11 +52,18 @@ pub struct ExtractedContext {
 
     /// The source file content with the entire comment block removed,
     /// including any leading blank line left between the block and the
-    /// first real line of code.
+    /// first real line of code. Line endings match the original (`\r\n`
+    /// stays `\r\n`).
     pub cleaned_source: String,
 }
 
 /// Attempt to find and extract an `<<<LLMCTX … LLMCTX>>>` block from `source`.
+///
+/// Only a block at the top of the file counts: the opening delimiter must be
+/// the first non-blank line, or follow nothing but language-mandated preamble
+/// (a shebang, a Rust `#![…]` attribute, an encoding cookie, `<?php`, …).
+/// Anything further down — an example in documentation, a test fixture — is
+/// ordinary file content and is never touched.
 ///
 /// On success the caller receives a clean (context, source) pair.
 /// On any error the source is left completely untouched — the caller should
@@ -60,11 +71,8 @@ pub struct ExtractedContext {
 pub fn extract_llmctx_block(source: &str) -> Result<ExtractedContext, ExtractError> {
     let lines: Vec<&str> = source.lines().collect();
 
-    // ── 1. Find the opening delimiter line ───────────────────────────────────
-    let open_idx = lines
-        .iter()
-        .position(|l| strip_comment_prefix(l).trim() == OPEN_DELIMITER)
-        .ok_or(ExtractError::NoDelimiter)?;
+    // ── 1. Find the opening delimiter line at the top of the file ────────────
+    let open_idx = find_open_delimiter(&lines).ok_or(ExtractError::NoDelimiter)?;
 
     // ── 2. Find the closing delimiter within the search window ───────────────
     let search_end = (open_idx + 1 + MAX_BLOCK_LINES).min(lines.len());
@@ -126,20 +134,59 @@ pub fn extract_llmctx_block(source: &str) -> Result<ExtractedContext, ExtractErr
     // Everything after the blank separator.
     remaining.extend_from_slice(&lines[code_start..]);
 
-    // Re-join preserving the original line ending style (assume \n; \r\n is
-    // normalised to \n on read and re-written as \n — acceptable for source files).
-    let cleaned_source = remaining.join("\n");
-    // Preserve a trailing newline if the original had one.
-    let cleaned_source = if source.ends_with('\n') {
-        format!("{cleaned_source}\n")
+    // Re-join with the file's own line ending. `lines()` drops the `\r` of
+    // every `\r\n`, and writing plain `\n` back would turn a one-block edit
+    // into a whole-file diff on Windows checkouts.
+    let eol = if source.contains("\r\n") {
+        "\r\n"
     } else {
-        cleaned_source
+        "\n"
     };
+    let mut cleaned_source = remaining.join(eol);
+    // Preserve a trailing newline if the original had one.
+    if source.ends_with('\n') && !cleaned_source.is_empty() {
+        cleaned_source.push_str(eol);
+    }
 
     Ok(ExtractedContext {
         body,
         cleaned_source,
     })
+}
+
+/// Index of the opening delimiter if it sits at the top of the file.
+fn find_open_delimiter(lines: &[&str]) -> Option<usize> {
+    let mut preamble = 0;
+    for (idx, line) in lines.iter().enumerate() {
+        if strip_comment_prefix(line).trim() == OPEN_DELIMITER {
+            return Some(idx);
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        if is_preamble(line) && preamble < MAX_PREAMBLE_LINES {
+            preamble += 1;
+            continue;
+        }
+        // Real content came first: any delimiter further down is not ours.
+        return None;
+    }
+    None
+}
+
+/// Lines a language requires before anything else, so the block may follow them.
+fn is_preamble(line: &str) -> bool {
+    let t = line.trim();
+    let lower = t.to_ascii_lowercase();
+    t.starts_with("#!")                          // shebang, Rust `#![…]`
+        || t.starts_with("<?")                   // <?php, <?xml
+        || lower.starts_with("<!doctype")
+        || lower.starts_with("# -*-")            // Python/Ruby encoding cookie
+        || lower.starts_with("# vim:")
+        || lower.starts_with("# coding")
+        || lower.starts_with("# frozen_string_literal")
+        || t == "\"use strict\";"
+        || t == "'use strict';"
 }
 
 /// Strip the comment prefix from a single line, returning the remainder.
@@ -155,9 +202,7 @@ pub fn strip_comment_prefix(line: &str) -> &str {
     let trimmed = line.trim_start();
 
     // Try each prefix in longest-first order so `<!-- ` beats `<`.
-    const PREFIXES: &[&str] = &[
-        "<!-- ", "<!---", "// ", "# ", "/* ", " * ", "* ", "//", "#",
-    ];
+    const PREFIXES: &[&str] = &["<!-- ", "<!---", "// ", "# ", "/* ", " * ", "* ", "//", "#"];
     for prefix in PREFIXES {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             return rest;
@@ -284,6 +329,42 @@ pass
             extract_llmctx_block(&src),
             Err(ExtractError::UnclosedBlock)
         ));
+    }
+
+    #[test]
+    fn block_below_other_content_is_ignored() {
+        // Documentation that shows the format (like docs/llmctx.md) must never
+        // be rewritten: only a block at the very top of a file is a block.
+        let doc = format!(
+            "# The format\n\nExample:\n\n```python\n{}```\n",
+            python_block()
+        );
+        assert!(matches!(
+            extract_llmctx_block(&doc),
+            Err(ExtractError::NoDelimiter)
+        ));
+    }
+
+    #[test]
+    fn block_after_shebang_and_attributes_is_found() {
+        let src = format!(
+            "#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n{}",
+            python_block()
+        );
+        let result = extract_llmctx_block(&src).unwrap();
+        assert!(result
+            .cleaned_source
+            .starts_with("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\ndef verify_token"));
+
+        let rust = format!("#![allow(dead_code)]\n\n{}", js_block());
+        assert!(extract_llmctx_block(&rust).is_ok());
+    }
+
+    #[test]
+    fn crlf_line_endings_are_preserved() {
+        let src = python_block().replace('\n', "\r\n");
+        let result = extract_llmctx_block(&src).unwrap();
+        assert_eq!(result.cleaned_source, "def verify_token():\r\n    pass\r\n");
     }
 
     #[test]

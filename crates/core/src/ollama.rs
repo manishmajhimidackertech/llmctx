@@ -1,18 +1,25 @@
 // <<<LLMCTX
 // FILE: crates/core/src/ollama.rs
-// ROLE: Send a source file to Ollama and return the generated six-field context body
-// EXPORTS: OllamaClient, OllamaError, GeneratedContext
+// ROLE: Send a source file to Ollama and return validated six-field context
+// EXPORTS: OllamaClient, OllamaError, GeneratedContext, resolve_ollama_url(), OLLAMA_URL_ENV
 // IMPORTS: crates/core/src/config.rs
-// USED BY: crates/core/src/process.rs
-// NOTES: Returns raw body text only — caller (process.rs) prepends header and version stamp
+// USED BY: crates/core/src/process.rs, crates/cli/src/main.rs, crates/daemon/src/main.rs
+// NOTES: Repo configs may only point at a local Ollama; LLMCTX_OLLAMA_URL (set by the user) may point anywhere. Output is JSON, validated, retried once
 // LLMCTX>>>
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::config::ProjectConfig;
+
+/// Environment variable through which the *user* (not a repository) chooses
+/// the Ollama server. The VS Code extension sets it from `llmctx.ollamaUrl`.
+pub const OLLAMA_URL_ENV: &str = "LLMCTX_OLLAMA_URL";
+
+const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 
 #[derive(Debug, Error)]
 pub enum OllamaError {
@@ -53,6 +60,20 @@ pub enum OllamaError {
 
     #[error("Ollama response was empty or contained no usable content")]
     EmptyResponse,
+
+    #[error("Ollama's answer was not usable context ({detail}), even after one retry")]
+    InvalidOutput { detail: String },
+
+    #[error(
+        "refusing to send source to {url}: `ollama_url` in llmcontext.yaml may only point at this \
+         machine (localhost, 127.0.0.1, ::1), because a cloned repository must not decide where \
+         your code goes. To use a remote Ollama, set the {OLLAMA_URL_ENV} environment variable \
+         (or `llmctx.ollamaUrl` in VS Code)."
+    )]
+    RemoteNotAllowed { url: String },
+
+    #[error("invalid Ollama URL {url:?}: {detail}")]
+    InvalidUrl { url: String, detail: String },
 }
 
 impl OllamaError {
@@ -96,8 +117,44 @@ fn classify(e: reqwest::Error, url: &str, secs: u64) -> OllamaError {
 /// The parsed result of a successful Ollama generation.
 #[derive(Debug, Clone)]
 pub struct GeneratedContext {
-    /// Six-field body text, ready to be written to ADS after header injection.
-    pub body: String,
+    /// The six field lines, `FILE:` through `NOTES:`, ready to store.
+    pub fields: String,
+}
+
+// ── URL policy ───────────────────────────────────────────────────────────────
+
+/// The Ollama base URL to use for a project.
+///
+/// `LLMCTX_OLLAMA_URL` wins and may point anywhere: only the user can set
+/// it. `ollama_url` from `llmcontext.yaml` comes from the repository, so it
+/// may only name this machine — otherwise cloning a repository and saving a
+/// file could ship your source code to a server of the repository's choosing.
+pub fn resolve_ollama_url(config: &ProjectConfig) -> Result<String, OllamaError> {
+    if let Ok(url) = std::env::var(OLLAMA_URL_ENV) {
+        let url = url.trim().trim_end_matches('/').to_string();
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    let Some(url) = config.ollama_url.as_deref() else {
+        return Ok(DEFAULT_OLLAMA_URL.to_string());
+    };
+    let url = url.trim().trim_end_matches('/').to_string();
+    let parsed = reqwest::Url::parse(&url).map_err(|e| OllamaError::InvalidUrl {
+        url: url.clone(),
+        detail: e.to_string(),
+    })?;
+    let local = match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if local {
+        Ok(url)
+    } else {
+        Err(OllamaError::RemoteNotAllowed { url })
+    }
 }
 
 // ── Ollama API types (generate endpoint) ────────────────────────────────────
@@ -107,6 +164,19 @@ struct GenerateRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     stream: bool,
+    /// Constrain the answer to JSON so it can be parsed, not scraped.
+    format: &'a str,
+    options: GenerateOptions,
+}
+
+#[derive(Serialize)]
+struct GenerateOptions {
+    /// Deterministic answers: the same file should get the same context.
+    temperature: f32,
+    /// Context window. Ollama's default is small enough that a file near
+    /// `ollama_max_bytes` would be truncated silently. Fixed per project,
+    /// because changing it between requests makes Ollama reload the model.
+    num_ctx: u32,
 }
 
 #[derive(Deserialize)]
@@ -157,7 +227,7 @@ impl OllamaClient {
     /// once, immediately, with an accurate message — instead of once per file
     /// after a full timeout each.
     pub async fn list_models(&self, config: &ProjectConfig) -> Result<Vec<String>, OllamaError> {
-        let url = format!("{}/api/tags", config.ollama_url_or_default());
+        let url = format!("{}/api/tags", resolve_ollama_url(config)?);
 
         let resp = self
             .http
@@ -181,22 +251,49 @@ impl OllamaClient {
         Ok(parsed.models.into_iter().map(|m| m.name).collect())
     }
 
-    /// Generate context for `source_code` using the project config and the
-    /// relative file path `rel_path` (used in the prompt for file identity).
+    /// Generate the six fields for `source_code` at `rel_path` (used in the
+    /// prompt, and always written as the `FILE:` field).
+    ///
+    /// The answer is validated; an unusable one (not JSON, no ROLE) is
+    /// retried once before giving up, since small models occasionally ramble.
     pub async fn generate(
         &self,
         config: &ProjectConfig,
         rel_path: &str,
         source_code: &str,
     ) -> Result<GeneratedContext, OllamaError> {
-        let url = format!("{}/api/generate", config.ollama_url_or_default());
-        let secs = config.ollama_timeout_secs_or_default();
         let prompt = build_prompt(config, rel_path, source_code);
+        let mut last = String::new();
+        for attempt in 1..=2 {
+            let raw = self.generate_raw(config, &prompt).await?;
+            match parse_generated(&raw, rel_path) {
+                Ok(fields) => return Ok(GeneratedContext { fields }),
+                Err(detail) => {
+                    warn!(rel_path, attempt, "unusable Ollama answer: {detail}");
+                    last = detail;
+                }
+            }
+        }
+        Err(OllamaError::InvalidOutput { detail: last })
+    }
+
+    async fn generate_raw(
+        &self,
+        config: &ProjectConfig,
+        prompt: &str,
+    ) -> Result<String, OllamaError> {
+        let url = format!("{}/api/generate", resolve_ollama_url(config)?);
+        let secs = config.ollama_timeout_secs_or_default();
 
         let req = GenerateRequest {
             model: config.ollama_model_or_default(),
-            prompt: &prompt,
+            prompt,
             stream: false,
+            format: "json",
+            options: GenerateOptions {
+                temperature: 0.0,
+                num_ctx: config.ollama_num_ctx_or_default(),
+            },
         };
 
         let resp = self
@@ -231,9 +328,92 @@ impl OllamaClient {
         if body.is_empty() {
             return Err(OllamaError::EmptyResponse);
         }
-
-        Ok(GeneratedContext { body })
+        Ok(body)
     }
+}
+
+// ── Answer parsing ───────────────────────────────────────────────────────────
+
+/// Turn the model's answer into the six field lines, or explain why not.
+///
+/// JSON is expected (`format: "json"`), but a `KEY: value` answer — what an
+/// older Ollama that ignores `format` tends to produce — is accepted too.
+/// `FILE:` is always the real path and `USED BY:` is always `UNKNOWN`: the
+/// model sees one file and cannot know either; `USED BY` is computed from the
+/// other files' `IMPORTS` when context is packed.
+fn parse_generated(raw: &str, rel_path: &str) -> Result<String, String> {
+    let cleaned = strip_code_fence(raw);
+    let mut values = std::collections::HashMap::<String, String>::new();
+
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(cleaned) {
+        for (key, value) in map {
+            values.insert(normalise_key(&key), json_to_text(&value));
+        }
+    } else {
+        for line in cleaned.lines() {
+            if let Some((key, value)) = line.split_once(':') {
+                values
+                    .entry(normalise_key(key))
+                    .or_insert_with(|| value.trim().to_string());
+            }
+        }
+    }
+
+    let get = |key: &str, default: &str| -> String {
+        values
+            .get(key)
+            .map(|v| one_line(v))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let role = get("role", "");
+    if role.is_empty() {
+        return Err(format!(
+            "no ROLE in answer: {:?}",
+            cleaned.chars().take(120).collect::<String>()
+        ));
+    }
+    Ok(format!(
+        "FILE: {rel_path}\nROLE: {role}\nEXPORTS: {}\nIMPORTS: {}\nUSED BY: UNKNOWN\nNOTES: {}",
+        get("exports", "NONE"),
+        get("imports", "NONE"),
+        get("notes", "NONE"),
+    ))
+}
+
+fn strip_code_fence(raw: &str) -> &str {
+    let t = raw.trim();
+    let Some(rest) = t.strip_prefix("```") else {
+        return t;
+    };
+    let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
+    rest.trim_end().strip_suffix("```").unwrap_or(rest).trim()
+}
+
+/// `"Used By"`, `"USED_BY"`, `"used by"` → `"usedby"`.
+fn normalise_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn json_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(json_to_text)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl Default for OllamaClient {
@@ -259,14 +439,14 @@ Conventions:
 - {conventions}
 Current task: {task}
 
-Analyze this file and return ONLY a context block in this exact format (no extra text, no markdown):
+Analyze the file below and answer with ONLY a JSON object with exactly these keys:
 
-FILE: <filename>
-ROLE: <one sentence — what this file does>
-EXPORTS: <key functions/classes/constants, comma separated, or NONE>
-IMPORTS: <other project files this depends on, comma separated, or NONE>
-USED BY: <files likely to import this, comma separated, or UNKNOWN>
-NOTES: <anything unusual an LLM should know, or NONE>
+{{
+  "role": "one sentence: what this file does",
+  "exports": "key functions/classes/constants it exposes, comma separated, or NONE",
+  "imports": "other files of this project it depends on, as paths relative to the project root, comma separated, or NONE",
+  "notes": "anything unusual an LLM should know, or NONE"
+}}
 
 File path: {rel_path}
 
@@ -292,6 +472,74 @@ mod tests {
         assert!(prompt.contains("src/foo.rs"));
         assert!(prompt.contains("fn foo()"));
         assert!(prompt.contains("TestProj"));
+    }
+
+    #[test]
+    fn json_answers_become_six_fields() {
+        let raw = r#"{"Role": "Parses config", "exports": ["load", "save"], "IMPORTS": "a.rs", "notes": null, "file": "wrong.rs", "used_by": "x.rs"}"#;
+        assert_eq!(
+            parse_generated(raw, "src/config.rs").unwrap(),
+            "FILE: src/config.rs\nROLE: Parses config\nEXPORTS: load, save\nIMPORTS: a.rs\nUSED BY: UNKNOWN\nNOTES: NONE"
+        );
+    }
+
+    #[test]
+    fn fenced_and_plain_text_answers_are_accepted() {
+        let fenced = "```json\n{\"role\": \"Does\\nthings\"}\n```";
+        assert!(parse_generated(fenced, "a.rs")
+            .unwrap()
+            .contains("ROLE: Does things"));
+
+        let text = "Sure! Here it is:\nROLE: Handles auth\nEXPORTS: login()\n";
+        let fields = parse_generated(text, "a.rs").unwrap();
+        assert!(fields.contains("ROLE: Handles auth"));
+        assert!(fields.contains("EXPORTS: login()"));
+    }
+
+    #[test]
+    fn answers_without_a_role_are_rejected() {
+        assert!(parse_generated("I cannot help with that.", "a.rs").is_err());
+        assert!(parse_generated("{\"exports\": \"x\"}", "a.rs").is_err());
+    }
+
+    #[test]
+    fn repo_config_may_only_point_at_this_machine() {
+        // Only meaningful when the user has not set the override.
+        if std::env::var(OLLAMA_URL_ENV).is_ok() {
+            return;
+        }
+        let with = |url: &str| ProjectConfig {
+            ollama_url: Some(url.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_ollama_url(&ProjectConfig::default()).unwrap(),
+            DEFAULT_OLLAMA_URL
+        );
+        for ok in [
+            "http://localhost:11434/",
+            "http://127.0.0.1:9",
+            "http://[::1]:11434",
+        ] {
+            assert!(resolve_ollama_url(&with(ok)).is_ok(), "{ok}");
+        }
+        for bad in [
+            "https://attacker.example",
+            "http://10.0.0.5:11434",
+            "http://localhost.evil.com",
+        ] {
+            assert!(
+                matches!(
+                    resolve_ollama_url(&with(bad)),
+                    Err(OllamaError::RemoteNotAllowed { .. })
+                ),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            resolve_ollama_url(&with("not a url")),
+            Err(OllamaError::InvalidUrl { .. })
+        ));
     }
 
     #[test]

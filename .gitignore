@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 
 # VS Code extension build output
 vscode-extension/out/

@@ -1,11 +1,15 @@
 // <<<LLMCTX
 // FILE: crates/core/src/ads.rs
-// ROLE: Read and write the file:llmctx NTFS Alternate Data Stream on Windows
+// ROLE: Legacy reader/writer for the file:llmctx NTFS Alternate Data Stream, kept for `llmctx migrate`
 // EXPORTS: read_ads(), write_ads(), ads_exists(), clear_ads(), AdsError
 // IMPORTS: NONE
-// USED BY: crates/core/src/process.rs, crates/cli/src/main.rs
+// USED BY: crates/core/src/migrate.rs, crates/cli/src/main.rs
 // NOTES: Windows/NTFS only — every public function returns Err(AdsError::NotSupported) on non-Windows
 // LLMCTX>>>
+
+//! Where llmctx used to keep context before the project store
+//! (`store.rs`) replaced it. Nothing writes here any more; `llmctx migrate`
+//! reads existing streams into the store and can optionally remove them.
 
 use thiserror::Error;
 
@@ -112,9 +116,8 @@ mod windows_impl {
     use windows::{
         core::HSTRING,
         Win32::Storage::FileSystem::{
-            CreateFileW, DeleteFileW, ReadFile, WriteFile,
-            FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-            FILE_SHARE_READ, OPEN_ALWAYS, OPEN_EXISTING,
+            CreateFileW, DeleteFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL,
+            FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, OPEN_ALWAYS, OPEN_EXISTING,
         },
     };
 
@@ -167,11 +170,12 @@ mod windows_impl {
         let mut buf = vec![0u8; 65536];
         let mut bytes_read: u32 = 0;
         unsafe {
-            ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None)
-                .map_err(|e| AdsError::Io {
+            ReadFile(handle, Some(&mut buf), Some(&mut bytes_read), None).map_err(|e| {
+                AdsError::Io {
                     path: sp.clone(),
                     source: std::io::Error::from_raw_os_error(e.code().0),
-                })?;
+                }
+            })?;
             windows::Win32::Foundation::CloseHandle(handle).ok();
         }
 
@@ -182,11 +186,7 @@ mod windows_impl {
         let raw = String::from_utf8_lossy(&buf[..bytes_read as usize]).into_owned();
         validate_version(&raw, &sp)?;
         // Strip the version line before returning so callers see only the body.
-        let body = raw
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = raw.lines().skip(1).collect::<Vec<_>>().join("\n");
         Ok(body)
     }
 
@@ -220,11 +220,10 @@ mod windows_impl {
 
         let mut written: u32 = 0;
         unsafe {
-            WriteFile(handle, Some(bytes), Some(&mut written), None)
-                .map_err(|e| AdsError::Io {
-                    path: sp.clone(),
-                    source: std::io::Error::from_raw_os_error(e.code().0),
-                })?;
+            WriteFile(handle, Some(bytes), Some(&mut written), None).map_err(|e| AdsError::Io {
+                path: sp.clone(),
+                source: std::io::Error::from_raw_os_error(e.code().0),
+            })?;
             windows::Win32::Foundation::CloseHandle(handle).ok();
         }
         Ok(())
@@ -266,10 +265,30 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
-    /// Version stamp round-trip is tested in process.rs integration tests
-    /// since they need a real temp file. Here we just verify the constant.
     #[test]
     fn version_constant_is_one() {
         assert_eq!(super::ADS_VERSION, 1);
+    }
+
+    /// Real NTFS streams: runs on the Windows CI runner.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stream_round_trip() {
+        use super::*;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        assert!(!ads_exists(&file).unwrap());
+        write_ads(&file, "FILE: a.txt\nROLE: r").unwrap();
+        assert!(ads_exists(&file).unwrap());
+        assert_eq!(read_ads(&file).unwrap(), "FILE: a.txt\nROLE: r");
+        // A shorter rewrite must not leave stale tail bytes behind.
+        write_ads(&file, "x").unwrap();
+        assert_eq!(read_ads(&file).unwrap(), "x");
+        clear_ads(&file).unwrap();
+        assert!(!ads_exists(&file).unwrap());
+        // The file's own content is untouched throughout.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "content");
     }
 }

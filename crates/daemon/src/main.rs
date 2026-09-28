@@ -1,19 +1,13 @@
 // <<<LLMCTX
 // FILE: crates/daemon/src/main.rs
-// ROLE: Background daemon — listens for VS Code save events, runs extraction immediately, debounces Ollama
+// ROLE: Background daemon — authenticated local socket for editor saves/renames/deletes; extracts immediately, debounces Ollama
 // EXPORTS: NONE (binary)
-// IMPORTS: crates/core/src/process.rs, crates/core/src/ads.rs, crates/core/src/config.rs
+// IMPORTS: crates/core/src/process.rs, crates/core/src/store.rs, crates/core/src/runtime.rs, crates/core/src/ollama.rs, crates/core/src/config.rs
 // USED BY: UNKNOWN
-// NOTES: One process per machine; bounded Ollama worker pool (default 2); extraction never debounced
+// NOTES: One process per user; OS-assigned port published with a token in the per-user discovery file; concurrency per Ollama server from config
 // LLMCTX>>>
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -21,50 +15,60 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::{mpsc, Mutex, Semaphore},
-    time::sleep,
+    time::{sleep, timeout},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use llmctx_core::{
-    ollama::OllamaClient,
-    process::{self, ProcessOptions, ProcessSource},
+    config::{self, ProjectConfig},
+    ollama::{self, OllamaClient},
+    process::{self, Plan, ProcessOptions, ProcessSource},
+    runtime::{self, DaemonInfo},
+    store,
 };
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-
-/// Primary port the daemon listens on.
-const DAEMON_PORT: u16 = 51515;
-
-/// If the primary port is already taken, try up to this many sequential ports
-/// before giving up (51515, 51516, … 51524).
-const PORT_RETRY_COUNT: u16 = 10;
 
 /// Debounce window for the Ollama branch only.
 /// Extraction runs immediately and is never gated behind this timer.
 const OLLAMA_DEBOUNCE_SECS: u64 = 30;
 
-/// Default concurrency cap for Ollama jobs.
-const DEFAULT_OLLAMA_CONCURRENCY: usize = 2;
+/// A client must authenticate within this long after connecting.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Set to a port number to listen on a fixed port instead of one the OS
+/// picks. Clients never need it: they read the port from the discovery file.
+const PORT_ENV: &str = "LLMCTX_DAEMON_PORT";
+
+/// Set to any value to skip the startup update check.
+const NO_UPDATE_CHECK_ENV: &str = "LLMCTX_NO_UPDATE_CHECK";
 
 /// GitHub Releases API endpoint for the update check.
-/// Replace `your-org/llmctx` with the real repository path before publishing.
 const RELEASES_URL: &str =
-    "https://api.github.com/repos/your-org/llmctx/releases/latest";
+    "https://api.github.com/repos/manishmajhimidackertech/llmctx/releases/latest";
 
 // ── Socket protocol types (NDJSON) ────────────────────────────────────────────
 
-/// Message received from the VS Code extension.
+/// Message received from a client (the VS Code extension).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum InboundMessage {
+    /// Must be the first message on every connection.
+    Hello { token: String },
     /// Sent on every file save.
     Save { path: String, hash: String },
+    /// A file or directory was renamed or moved in the editor.
+    Rename { from: String, to: String },
+    /// A file or directory was deleted in the editor.
+    Delete { path: String },
 }
 
-/// Message sent back to the VS Code extension.
+/// Message sent back to the client.
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum OutboundMessage {
+    /// Reply to a valid `hello`.
+    Welcome { version: String },
     /// Pushed whenever a file's context state changes.
     Status {
         path: String,
@@ -79,42 +83,89 @@ enum OutboundMessage {
     },
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 enum StatusState {
     Queued,
     Generating,
+    /// The file has stored context matching its content.
     Ready,
+    /// Nothing will be generated for this file (message says why).
+    Skipped,
     Error,
 }
 
-// ── Debounce tracker ──────────────────────────────────────────────────────────
+// ── Shared state ──────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct DebounceEntry {
-    /// When the save that created this entry was observed. Not currently read
-    /// — debouncing is decided by `hash` plus a fixed sleep — but kept because
-    /// it is what any adaptive-delay change would need.
-    #[allow(dead_code)]
-    last_save: Instant,
-    hash: String,
-}
-
-type DebounceMap = Arc<Mutex<HashMap<PathBuf, DebounceEntry>>>;
-
-// ── Client registry — used to broadcast update notices ───────────────────────
-
-/// A sender handle for one connected VS Code extension instance.
 type ClientTx = mpsc::UnboundedSender<OutboundMessage>;
 
-/// All currently-connected clients.  Protected by a Mutex so the update-check
-/// task can broadcast to them without knowing who connected when.
-type ClientRegistry = Arc<Mutex<Vec<ClientTx>>>;
+struct Daemon {
+    client: OllamaClient,
+    token: String,
+    /// Latest saved hash per path: a queued generation only proceeds if no
+    /// newer save arrived during its debounce window.
+    latest_save: Mutex<HashMap<PathBuf, String>>,
+    limits: Limits,
+    /// All authenticated clients, for broadcasts (update notices).
+    clients: Mutex<Vec<ClientTx>>,
+}
+
+/// One concurrency limit per Ollama server, sized by the projects' own
+/// `ollama_concurrency` (the largest seen wins: someone raised
+/// OLLAMA_NUM_PARALLEL on that server).
+#[derive(Default)]
+struct Limits {
+    by_url: Mutex<HashMap<String, (Arc<Semaphore>, usize)>>,
+}
+
+impl Limits {
+    async fn semaphore_for(&self, config: &ProjectConfig) -> Arc<Semaphore> {
+        let key = ollama::resolve_ollama_url(config).unwrap_or_else(|_| "(invalid)".into());
+        let want = config.ollama_concurrency_or_default();
+        let mut map = self.by_url.lock().await;
+        let (sem, size) = map
+            .entry(key)
+            .or_insert_with(|| (Arc::new(Semaphore::new(want)), want));
+        if want > *size {
+            sem.add_permits(want - *size);
+            *size = want;
+        }
+        Arc::clone(sem)
+    }
+}
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // No subcommands, so no clap: just the two flags people reach for (the
+    // install docs verify with `llmctxd --version`). Anything else would
+    // otherwise silently start a daemon.
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("llmctxd {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "-h" | "--help" => {
+                println!(
+                    "llmctxd {} — llmctx background daemon\n\n\
+                     Usage: llmctxd\n\n\
+                     Usually started by the VS Code extension. Listens on 127.0.0.1 and\n\
+                     publishes its port and token in a per-user discovery file.\n\n\
+                     Environment:\n  \
+                       {PORT_ENV}=<port>     listen on a fixed port\n  \
+                       {NO_UPDATE_CHECK_ENV}=1  skip the startup update check\n  \
+                       LLMCTX_RUNTIME_DIR=<dir>    where to write daemon.json\n  \
+                       LLMCTX_OLLAMA_URL=<url>     Ollama server to use for every project",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return Ok(());
+            }
+            other => anyhow::bail!("unknown argument {other:?} (try --help)"),
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -123,93 +174,137 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // ── Bind with port fallback ───────────────────────────────────────────────
-    let (listener, bound_port) = bind_with_fallback(DAEMON_PORT, PORT_RETRY_COUNT)
-        .context("failed to bind on any port in range {DAEMON_PORT}–{DAEMON_PORT+PORT_RETRY_COUNT}")?;
-    info!("llmctxd listening on 127.0.0.1:{bound_port}");
-    if bound_port != DAEMON_PORT {
-        warn!(
-            "default port {DAEMON_PORT} was in use — bound to {bound_port} instead. \
-             Set \"llmctx.daemonPort\": {bound_port} in VS Code settings."
-        );
+    // ── Single instance ───────────────────────────────────────────────────────
+    if let Some(existing) = runtime::read_daemon_info() {
+        if is_alive(&existing).await {
+            info!(
+                "llmctxd is already running (pid {}, port {}) — nothing to do",
+                existing.pid, existing.port
+            );
+            return Ok(());
+        }
     }
 
-    let client = Arc::new(OllamaClient::new());
-    let ollama_sem = Arc::new(Semaphore::new(DEFAULT_OLLAMA_CONCURRENCY));
-    let debounce: DebounceMap = Arc::new(Mutex::new(HashMap::new()));
-    let registry: ClientRegistry = Arc::new(Mutex::new(Vec::new()));
+    // ── Bind and publish ──────────────────────────────────────────────────────
+    let port: u16 = std::env::var(PORT_ENV)
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("could not listen on 127.0.0.1:{port}"))?;
+    let port = listener.local_addr()?.port();
 
-    // One-time update check — broadcasts to all connected clients if a newer
-    // version exists.  Runs concurrently; never blocks the accept loop.
-    tokio::spawn(check_for_update(Arc::clone(&registry)));
+    let info = DaemonInfo {
+        port,
+        token: runtime::new_token().context("could not generate an auth token")?,
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let file = runtime::write_daemon_info(&info).context("could not write the discovery file")?;
+    info!(
+        "llmctxd listening on 127.0.0.1:{port} (discovery file: {})",
+        file.display()
+    );
 
+    let daemon = Arc::new(Daemon {
+        client: OllamaClient::new(),
+        token: info.token.clone(),
+        latest_save: Mutex::new(HashMap::new()),
+        limits: Limits::default(),
+        clients: Mutex::new(Vec::new()),
+    });
+
+    if std::env::var_os(NO_UPDATE_CHECK_ENV).is_none() {
+        tokio::spawn(check_for_update(Arc::clone(&daemon)));
+    }
+
+    tokio::select! {
+        _ = accept_loop(listener, Arc::clone(&daemon)) => {}
+        _ = shutdown_signal() => info!("shutting down"),
+    }
+    runtime::remove_daemon_info(info.pid);
+    Ok(())
+}
+
+async fn accept_loop(listener: TcpListener, daemon: Arc<Daemon>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                info!("connection from {peer}");
-                let client = Arc::clone(&client);
-                let sem = Arc::clone(&ollama_sem);
-                let debounce = Arc::clone(&debounce);
-                let registry = Arc::clone(&registry);
+                debug!("connection from {peer}");
+                let daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, client, sem, debounce, registry).await
-                    {
+                    if let Err(e) = handle_connection(stream, daemon).await {
                         error!("connection error: {e}");
                     }
                 });
             }
-            Err(e) => {
-                error!("accept error: {e}");
-            }
+            Err(e) => error!("accept error: {e}"),
         }
     }
 }
 
-/// Try to bind on `start_port`, then `start_port+1`, … up to `retries` more.
-/// Returns the listener and the port it actually bound on.
-fn bind_with_fallback(start_port: u16, retries: u16) -> Result<(TcpListener, u16)> {
-    // TcpListener::bind is sync, so use std::net and convert.
-    for offset in 0..=retries {
-        let port = start_port.saturating_add(offset);
-        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-        match std::net::TcpListener::bind(addr) {
-            Ok(std_listener) => {
-                std_listener
-                    .set_nonblocking(true)
-                    .context("set_nonblocking failed")?;
-                let listener = TcpListener::from_std(std_listener)
-                    .context("tokio TcpListener::from_std failed")?;
-                return Ok((listener, port));
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
             }
-            Err(e) if offset < retries => {
-                warn!("port {port} unavailable ({e}), trying next…");
-            }
-            Err(e) => {
-                return Err(e).context(format!("could not bind port {port}"));
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
             }
         }
     }
-    unreachable!()
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// True if a daemon answering with `info`'s token is listening on its port.
+/// A stale discovery file whose port now belongs to some other program
+/// fails the handshake and reads as "not running".
+async fn is_alive(info: &DaemonInfo) -> bool {
+    let probe = async {
+        let stream = TcpStream::connect(("127.0.0.1", info.port)).await.ok()?;
+        let (read, mut write) = stream.into_split();
+        let hello = serde_json::json!({"type": "hello", "token": info.token});
+        write
+            .write_all(format!("{hello}\n").as_bytes())
+            .await
+            .ok()?;
+        let line = BufReader::new(read).lines().next_line().await.ok()??;
+        let reply: serde_json::Value = serde_json::from_str(&line).ok()?;
+        Some(reply["type"] == "welcome")
+    };
+    matches!(timeout(Duration::from_secs(2), probe).await, Ok(Some(true)))
 }
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-async fn handle_connection(
-    stream: TcpStream,
-    client: Arc<OllamaClient>,
-    ollama_sem: Arc<Semaphore>,
-    debounce: DebounceMap,
-    registry: ClientRegistry,
-) -> Result<()> {
-    let (read_half, write_half) = stream.into_split();
+async fn handle_connection(stream: TcpStream, daemon: Arc<Daemon>) -> Result<()> {
+    let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
+    // ── Authenticate: the first line must carry the token ─────────────────────
+    let first = match timeout(HELLO_TIMEOUT, lines.next_line()).await {
+        Ok(Ok(Some(line))) => line,
+        _ => return Ok(()),
+    };
+    match serde_json::from_str::<InboundMessage>(first.trim()) {
+        Ok(InboundMessage::Hello { token }) if runtime::tokens_match(&daemon.token, &token) => {}
+        _ => {
+            warn!("rejected a connection that did not present the daemon token");
+            return Ok(());
+        }
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<OutboundMessage>();
-
-    // Register this client so the update-check task can reach it.
-    registry.lock().await.push(tx.clone());
-
-    let mut write_half = write_half;
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Ok(mut json) = serde_json::to_string(&msg) {
@@ -220,6 +315,10 @@ async fn handle_connection(
             }
         }
     });
+    let _ = tx.send(OutboundMessage::Welcome {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    });
+    daemon.clients.lock().await.push(tx.clone());
 
     while let Some(line) = lines.next_line().await? {
         let line = line.trim().to_string();
@@ -229,18 +328,28 @@ async fn handle_connection(
 
         match serde_json::from_str::<InboundMessage>(&line) {
             Ok(InboundMessage::Save { path, hash }) => {
-                let path = PathBuf::from(&path);
                 let tx = tx.clone();
-                let client = Arc::clone(&client);
-                let sem = Arc::clone(&ollama_sem);
-                let debounce = Arc::clone(&debounce);
+                let daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
-                    handle_save(path, hash, tx, client, sem, debounce).await;
+                    handle_save(PathBuf::from(path), hash, tx, daemon).await;
                 });
             }
-            Err(e) => {
-                warn!("unrecognised message: {e} — raw: {line}");
+            Ok(InboundMessage::Rename { from, to }) => {
+                match store::move_context(&PathBuf::from(&from), &PathBuf::from(&to)) {
+                    Ok(0) => {}
+                    Ok(n) => info!("{from} → {to}: moved context for {n} file(s)"),
+                    Err(e) => warn!("{from} → {to}: could not move context: {e}"),
+                }
             }
+            Ok(InboundMessage::Delete { path }) => {
+                match store::forget_context(&PathBuf::from(&path)) {
+                    Ok(0) => {}
+                    Ok(n) => info!("{path}: deleted — dropped context for {n} file(s)"),
+                    Err(e) => warn!("{path}: could not drop context: {e}"),
+                }
+            }
+            Ok(InboundMessage::Hello { .. }) => {}
+            Err(e) => warn!("unrecognised message: {e} — raw: {line}"),
         }
     }
 
@@ -253,116 +362,120 @@ async fn handle_save(
     path: PathBuf,
     hash: String,
     tx: mpsc::UnboundedSender<OutboundMessage>,
-    client: Arc<OllamaClient>,
-    ollama_sem: Arc<Semaphore>,
-    debounce: DebounceMap,
+    daemon: Arc<Daemon>,
 ) {
-    {
-        let mut map = debounce.lock().await;
-        map.insert(
-            path.clone(),
-            DebounceEntry {
-                last_save: Instant::now(),
-                hash: hash.clone(),
-            },
-        );
-    }
+    let send = |state: StatusState, message: Option<String>| {
+        let _ = tx.send(OutboundMessage::Status {
+            path: path.display().to_string(),
+            state,
+            message,
+        });
+    };
 
-    // ── Extraction fast-path (immediate, no debounce, no semaphore) ───────────
-    let source = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
+    daemon
+        .latest_save
+        .lock()
+        .await
+        .insert(path.clone(), hash.clone());
+
+    // ── Decide first: most saves need no model at all ─────────────────────────
+    // Up-to-date, renamed, block-carrying, ignored and too-small files are all
+    // answered now; only real generation work is debounced and queued. This
+    // is also why a save of an unchanged file never shows "queued".
+    let plan = match process::plan(&path, ProcessOptions::new()) {
+        Ok(plan) => plan,
         Err(e) => {
-            warn!(?path, "could not read file for save handler: {e}");
+            send(StatusState::Error, Some(e.to_string()));
             return;
         }
     };
-
-    let has_block = llmctx_core::extract::extract_llmctx_block(&source).is_ok();
-
-    if has_block {
-        info!(?path, "save has <<<LLMCTX block — extracting immediately");
-        let send = |state, message: Option<String>| {
-            let _ = tx.send(OutboundMessage::Status {
-                path: path.display().to_string(),
-                state,
-                message,
-            });
-        };
-        match process::process_file(&path, &client, ProcessOptions::new()).await {
-            Ok(r)
-                if r.source == ProcessSource::Extracted
-                    || r.source == ProcessSource::UpToDate =>
-            {
-                send(StatusState::Ready, None)
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(?path, "extraction failed: {e}");
-                send(StatusState::Error, Some(e.to_string()));
-            }
+    match plan {
+        // Not ours to report on: settings files, scratch files, …
+        Plan::Skip(ProcessSource::SkippedNoProject) => {
+            forget_save(&daemon, &path, &hash).await;
+            return;
         }
-        return;
+        Plan::Skip(reason) => {
+            send(StatusState::Skipped, Some(reason.describe().to_string()));
+            forget_save(&daemon, &path, &hash).await;
+            return;
+        }
+        Plan::UpToDate => {
+            send(StatusState::Ready, None);
+            forget_save(&daemon, &path, &hash).await;
+            return;
+        }
+        Plan::Reuse | Plan::Extract => {
+            info!(?path, ?plan, "no model needed — processing immediately");
+            run(&path, &daemon, &send).await;
+            forget_save(&daemon, &path, &hash).await;
+            return;
+        }
+        Plan::Generate => {}
     }
 
     // ── Ollama branch — debounce + bounded concurrency ────────────────────────
-    let _ = tx.send(OutboundMessage::Status {
-        path: path.display().to_string(),
-        state: StatusState::Queued,
-        message: None,
-    });
-
+    send(StatusState::Queued, None);
     sleep(Duration::from_secs(OLLAMA_DEBOUNCE_SECS)).await;
 
-    {
-        let map = debounce.lock().await;
-        if let Some(entry) = map.get(&path) {
-            if entry.hash != hash {
-                info!(?path, "debounce: newer save detected, skipping");
-                return;
-            }
-            if let Ok(current) = std::fs::read_to_string(&path) {
-                if process::content_hash(&current) != hash {
-                    info!(?path, "debounce: file changed on disk, skipping");
-                    return;
-                }
-            }
+    if daemon.latest_save.lock().await.get(&path) != Some(&hash) {
+        debug!(?path, "debounce: newer save detected, skipping");
+        return;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(current) if process::content_hash(&current) != hash => {
+            debug!(?path, "debounce: file changed on disk, skipping");
+            return;
         }
+        Err(_) => return,
+        Ok(_) => {}
     }
 
-    let _permit = ollama_sem.acquire().await;
+    let config = config::load_config_for_file(&path)
+        .map(|(_, c)| c)
+        .unwrap_or_default();
+    let semaphore = daemon.limits.semaphore_for(&config).await;
+    let Ok(_permit) = semaphore.acquire_owned().await else {
+        return;
+    };
 
-    let _ = tx.send(OutboundMessage::Status {
-        path: path.display().to_string(),
-        state: StatusState::Generating,
-        message: None,
-    });
+    send(StatusState::Generating, None);
+    run(&path, &daemon, &send).await;
+    forget_save(&daemon, &path, &hash).await;
+}
 
-    match process::process_file(&path, &client, ProcessOptions::new()).await {
-        Ok(_) => {
-            info!(?path, "Ollama context generated");
-            let _ = tx.send(OutboundMessage::Status {
-                path: path.display().to_string(),
-                state: StatusState::Ready,
-                message: None,
-            });
+/// Run `process_file` and report the outcome honestly: `ready` only when
+/// context was actually stored.
+async fn run(path: &PathBuf, daemon: &Daemon, send: &impl Fn(StatusState, Option<String>)) {
+    match process::process_file(path, &daemon.client, ProcessOptions::new()).await {
+        Ok(r) if r.source.has_context() => {
+            info!(?path, "{}", r.source.describe());
+            send(StatusState::Ready, None);
         }
+        Ok(r) => send(StatusState::Skipped, Some(r.source.describe().to_string())),
         Err(e) => {
-            error!(?path, "Ollama generation failed: {e}");
-            let _ = tx.send(OutboundMessage::Status {
-                path: path.display().to_string(),
-                state: StatusState::Error,
-                message: Some(e.to_string()),
-            });
+            error!(?path, "context generation failed: {e}");
+            send(StatusState::Error, Some(e.to_string()));
         }
+    }
+}
+
+/// Drop the debounce entry once its save has been handled — unless a newer
+/// save for the same path has arrived meanwhile.
+async fn forget_save(daemon: &Daemon, path: &PathBuf, hash: &str) {
+    let mut map = daemon.latest_save.lock().await;
+    if map.get(path).map(String::as_str) == Some(hash) {
+        map.remove(path);
     }
 }
 
 // ── Update check ──────────────────────────────────────────────────────────────
 
 /// Check GitHub Releases once on startup.  If a newer version exists, broadcasts
-/// an `UpdateAvailable` message to every currently-connected VS Code client.
-/// Never self-replaces the running binary.
-async fn check_for_update(registry: ClientRegistry) {
+/// an `UpdateAvailable` message to every currently-connected client.
+/// Never self-replaces the running binary. Skipped when LLMCTX_NO_UPDATE_CHECK
+/// is set.
+async fn check_for_update(daemon: Arc<Daemon>) {
     // Small delay so the first client has time to connect and receive the notice.
     sleep(Duration::from_secs(5)).await;
 
@@ -391,11 +504,11 @@ async fn check_for_update(registry: ClientRegistry) {
     };
 
     if !resp.status().is_success() {
-        info!("update check: GitHub returned HTTP {}", resp.status());
+        // 404 simply means no release has been published yet.
+        debug!("update check: GitHub returned HTTP {}", resp.status());
         return;
     }
 
-    // Parse tag_name from the JSON response.
     let json: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
@@ -404,12 +517,9 @@ async fn check_for_update(registry: ClientRegistry) {
         }
     };
 
-    let latest_raw = match json["tag_name"].as_str() {
-        Some(t) => t,
-        None => {
-            warn!("update check: no tag_name in response");
-            return;
-        }
+    let Some(latest_raw) = json["tag_name"].as_str() else {
+        warn!("update check: no tag_name in response");
+        return;
     };
 
     // Strip leading `v` from tag (e.g. "v0.2.0" → "0.2.0").
@@ -421,8 +531,7 @@ async fn check_for_update(registry: ClientRegistry) {
             current_version: current.to_string(),
             latest_version: latest.to_string(),
         };
-        let clients = registry.lock().await;
-        for tx in clients.iter() {
+        for tx in daemon.clients.lock().await.iter() {
             let _ = tx.send(msg.clone());
         }
     } else {
@@ -476,5 +585,39 @@ mod tests {
     fn semver_ignores_prerelease_suffix() {
         // "0.2.0-beta" should parse as (0,2,0) — not crash
         assert_eq!(parse_semver("0.2.0-beta"), (0, 2, 0));
+    }
+
+    #[test]
+    fn protocol_messages_round_trip() {
+        let hello: InboundMessage =
+            serde_json::from_str(r#"{"type":"hello","token":"t"}"#).unwrap();
+        assert!(matches!(hello, InboundMessage::Hello { token } if token == "t"));
+        let rename: InboundMessage =
+            serde_json::from_str(r#"{"type":"rename","from":"a","to":"b"}"#).unwrap();
+        assert!(matches!(rename, InboundMessage::Rename { .. }));
+        let status = serde_json::to_string(&OutboundMessage::Status {
+            path: "p".into(),
+            state: StatusState::Skipped,
+            message: Some("why".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            status,
+            r#"{"type":"status","path":"p","state":"skipped","message":"why"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_follows_the_largest_config() {
+        let limits = Limits::default();
+        let one = ProjectConfig::default();
+        let three = ProjectConfig {
+            ollama_concurrency: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(limits.semaphore_for(&one).await.available_permits(), 1);
+        assert_eq!(limits.semaphore_for(&three).await.available_permits(), 3);
+        // Never shrinks below what another project asked for.
+        assert_eq!(limits.semaphore_for(&one).await.available_permits(), 3);
     }
 }

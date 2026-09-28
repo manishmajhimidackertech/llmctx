@@ -1,10 +1,10 @@
 // <<<LLMCTX
 // FILE: crates/cpctx/src/main.rs
-// ROLE: Context-preserving file/directory copy — clones NTFS ADS streams from source to destination
+// ROLE: Context-preserving file/directory copy — carries stored context from the source project's store to the destination's
 // EXPORTS: NONE (binary)
-// IMPORTS: crates/core/src/ads.rs
+// IMPORTS: crates/core/src/store.rs
 // USED BY: UNKNOWN
-// NOTES: `cpctx setup` registers the binary on PATH via PowerShell profile and HKCU environment
+// NOTES: Copies files first, then context, so the destination's llmcontext.yaml is in place before roots are resolved; `cpctx setup` registers binaries on PATH
 // LLMCTX>>>
 
 use std::{
@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
-use llmctx_core::ads;
+use llmctx_core::store::{self, set_field, ContextStore, StoreSet, STORE_DIR};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -28,11 +28,13 @@ use llmctx_core::ads;
 #[command(
     name = "cpctx",
     version,
-    about = "Context-preserving copy: copies files and re-attaches llmctx ADS streams on Windows/NTFS.",
+    about = "Context-preserving copy: copies files and carries their llmctx context along.",
     long_about = "cpctx copies files or directories the same way `cp` or Explorer would, \
-    but also reads the llmctx Alternate Data Stream from every source file and writes it \
-    to the destination, so context built up by llmctxd is never lost during a copy.\n\n\
-    On non-Windows platforms it falls back to a plain copy (no ADS to preserve).\n\n\
+    and also carries each file's llmctx context from the source project's .llmctx store \
+    into the destination project's store, so context is never lost when files move \
+    between projects.\n\n\
+    Copying a whole project folder with any tool already keeps its context (it lives in \
+    .llmctx/ inside the folder); cpctx is for copying files into a different project.\n\n\
     Run `cpctx setup` once to add the binary to your PATH permanently."
 )]
 struct Cli {
@@ -42,7 +44,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Copy SOURCE to DEST, preserving ADS context streams.
+    /// Copy SOURCE to DEST, carrying llmctx context along.
     ///
     /// If SOURCE is a directory, copies recursively (like `cp -r`).
     /// Existing files at DEST are overwritten.
@@ -84,7 +86,11 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Copy { source, dest, verbose } => cmd_copy(&source, &dest, verbose),
+        Command::Copy {
+            source,
+            dest,
+            verbose,
+        } => cmd_copy(&source, &dest, verbose),
         Command::Setup { bin_dir } => cmd_setup(bin_dir),
     }
 }
@@ -92,15 +98,42 @@ fn main() -> Result<()> {
 // ── copy ─────────────────────────────────────────────────────────────────────
 
 fn cmd_copy(source: &Path, dest: &Path, verbose: bool) -> Result<()> {
+    // Phase 1: copy the bytes, remembering every (source, destination) pair.
+    let mut copied = Vec::new();
     if source.is_dir() {
-        copy_dir(source, dest, verbose)
+        copy_dir(source, dest, verbose, &mut copied)?;
+
+        // A copied folder that lands outside every project becomes a project
+        // of its own, so its files have somewhere to keep their context.
+        if store::project_root(dest).is_none() {
+            ContextStore::open(dest)
+                .with_context(|| format!("failed to create context store in {}", dest.display()))?;
+        }
     } else {
-        copy_file(source, dest, verbose)
+        copy_file(source, dest, verbose, &mut copied)?;
     }
+
+    // Phase 2: carry context across. This runs only after every file is in
+    // place, so a copied llmcontext.yaml already marks the destination root.
+    let carried = carry_context(&copied, verbose);
+    info!(
+        "copied {} file(s), carried context for {carried}",
+        copied.len()
+    );
+    Ok(())
 }
 
-/// Recursively copy a directory tree, re-attaching ADS on every file.
-fn copy_dir(src_dir: &Path, dst_dir: &Path, verbose: bool) -> Result<()> {
+/// Recursively copy a directory tree.
+///
+/// `.llmctx/` directories are not copied byte-for-byte: the destination gets
+/// its own store, filled per file in phase 2, so a database that happens to
+/// be mid-write is never duplicated.
+fn copy_dir(
+    src_dir: &Path,
+    dst_dir: &Path,
+    verbose: bool,
+    copied: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
     std::fs::create_dir_all(dst_dir)
         .with_context(|| format!("failed to create {}", dst_dir.display()))?;
 
@@ -108,20 +141,28 @@ fn copy_dir(src_dir: &Path, dst_dir: &Path, verbose: bool) -> Result<()> {
         .with_context(|| format!("failed to read dir {}", src_dir.display()))?
     {
         let entry = entry?;
+        if entry.file_name() == STORE_DIR {
+            continue;
+        }
         let src_path = entry.path();
         let dst_path = dst_dir.join(entry.file_name());
 
         if src_path.is_dir() {
-            copy_dir(&src_path, &dst_path, verbose)?;
+            copy_dir(&src_path, &dst_path, verbose, copied)?;
         } else {
-            copy_file(&src_path, &dst_path, verbose)?;
+            copy_file(&src_path, &dst_path, verbose, copied)?;
         }
     }
     Ok(())
 }
 
-/// Copy a single file then re-attach its ADS to the destination.
-fn copy_file(src: &Path, dst: &Path, verbose: bool) -> Result<()> {
+/// Copy a single file's bytes.
+fn copy_file(
+    src: &Path,
+    dst: &Path,
+    verbose: bool,
+    copied: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
     // If dest is a directory, copy into it with the same filename.
     let dst = if dst.is_dir() {
         dst.join(src.file_name().unwrap_or(OsStr::new("file")))
@@ -144,35 +185,51 @@ fn copy_file(src: &Path, dst: &Path, verbose: bool) -> Result<()> {
     if verbose {
         println!("copied  {}", dst.display());
     }
+    copied.push((src.to_path_buf(), dst));
+    Ok(())
+}
 
-    // Re-attach ADS.
-    match ads::read_ads(src) {
-        Ok(context_body) => {
-            match ads::write_ads(&dst, &context_body) {
-                Ok(()) => {
-                    if verbose {
-                        println!("context {}", dst.display());
-                    } else {
-                        info!("restored ADS → {}", dst.display());
-                    }
-                }
+/// Copy each source file's stored context to its destination. Failures are
+/// warnings, never errors: the bytes are already copied, and missing context
+/// is regenerated by the next `llmctx index`. Returns how many were carried.
+fn carry_context(copied: &[(PathBuf, PathBuf)], verbose: bool) -> usize {
+    let mut stores = StoreSet::new();
+    let mut carried = 0;
+
+    for (src, dst) in copied {
+        let context = match stores.existing_for_file(src) {
+            Ok(Some((store, rel))) => match store.get(&rel) {
+                Ok(Some(context)) => context,
+                // No context for this file yet — nothing to carry. Normal.
+                Ok(None) => continue,
                 Err(e) => {
-                    warn!("could not write ADS to {}: {e}", dst.display());
+                    warn!("could not read context for {}: {e}", src.display());
+                    continue;
+                }
+            },
+            // Source is outside any project or has no store yet.
+            Ok(None) => continue,
+            Err(e) => {
+                warn!("could not open context store for {}: {e}", src.display());
+                continue;
+            }
+        };
+
+        let written = stores.for_file(dst).and_then(|(store, rel)| {
+            let fields = set_field(&context.fields, "FILE", &rel);
+            store.put(&rel, &context.content_hash, &context.source, &fields)
+        });
+        match written {
+            Ok(()) => {
+                carried += 1;
+                if verbose {
+                    println!("context {}", dst.display());
                 }
             }
-        }
-        Err(ads::AdsError::Empty) | Err(ads::AdsError::VersionMismatch { .. }) => {
-            // Source has no valid context yet — nothing to copy. This is normal.
-        }
-        Err(ads::AdsError::NotSupported) => {
-            // Non-Windows — silently skip, we already copied the file content.
-        }
-        Err(e) => {
-            warn!("could not read ADS from {}: {e}", src.display());
+            Err(e) => warn!("could not store context for {}: {e}", dst.display()),
         }
     }
-
-    Ok(())
+    carried
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────
@@ -350,9 +407,6 @@ fn powershell_profile_add(bin_dir: &str) -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn posix_setup_instructions(bin_dir: &str) {
-    println!();
-    println!("cpctx is a Windows/NTFS tool (ADS is not available on this platform),");
-    println!("but the binary still works as a plain `cp` replacement on other OSes.");
     println!();
     println!("To add cpctx to your PATH, add the following line to your shell profile");
     println!("(~/.bashrc, ~/.zshrc, ~/.profile, etc.):");
